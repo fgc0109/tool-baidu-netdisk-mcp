@@ -1,9 +1,11 @@
 using System.Net;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
 using BaiduNetdisk.Api;
 using BaiduNetdisk.Download;
 using BaiduNetdisk.OAuth;
+using BaiduNetdisk.Upload;
 
 var tests = new (string Name, Func<Task> Run)[]
 {
@@ -23,7 +25,12 @@ var tests = new (string Name, Func<Task> Run)[]
     ("流式下载并校验文件", FileDownloadIsVerified),
     ("默认拒绝覆盖文件", ExistingDownloadIsPreserved),
     ("校验失败时清理临时文件", InvalidDownloadIsCleanedUp),
-    ("取消下载时清理临时文件", CancelledDownloadIsCleanedUp)
+    ("取消下载时清理临时文件", CancelledDownloadIsCleanedUp),
+    ("完成预创建分片和最终创建", SmallFileUploadCompletes),
+    ("仅上传缺失分片并重试", MissingUploadPartIsRetried),
+    ("空文件支持服务端秒传", EmptyFileUsesRapidUpload),
+    ("上传严格限制应用目录", UploadIsRestrictedToAppRoot),
+    ("拒绝不可信上传域名", UntrustedUploadHostIsRejected)
 };
 
 var failures = 0;
@@ -420,6 +427,207 @@ static async Task CancelledDownloadIsCleanedUp()
     }
 }
 
+static async Task SmallFileUploadCompletes()
+{
+    var payload = Encoding.UTF8.GetBytes("small upload content");
+    var expectedMd5 = Convert.ToHexString(MD5.HashData(payload)).ToLowerInvariant();
+    var directory = CreateTemporaryDirectory();
+    var localPath = Path.Combine(directory, "upload.txt");
+    await File.WriteAllBytesAsync(localPath, payload);
+    var calls = new List<string>();
+    var progress = new RecordingUploadProgress();
+    var service = CreateUploadService(request =>
+    {
+        var method = QueryValue(request.RequestUri!, "method");
+        calls.Add(method ?? "unknown");
+        return method switch
+        {
+            "precreate" => HandlePrecreate(request, expectedMd5, payload.Length, [0]),
+            "locateupload" => Json(HttpStatusCode.OK,
+                """{"errno":0,"request_id":2,"servers":[{"server":"https://c1.pcs.baidu.com"}]}"""),
+            "upload" => HandleUploadPart(request, payload, expectedPartIndex: 0),
+            "create" => HandleCreate(request, expectedMd5, payload.Length, 7001),
+            _ => throw new InvalidOperationException($"未知上传调用：{method}")
+        };
+    });
+
+    try
+    {
+        var result = await service.UploadFileAsync(
+            "access-value",
+            localPath,
+            "/apps/demo/upload.txt",
+            progress: progress);
+
+        Assert(calls.SequenceEqual(new[] { "precreate", "locateupload", "upload", "create" }),
+            "上传调用顺序不正确。");
+        Assert(result.FileSystemId == 7001, "上传结果 fs_id 不正确。");
+        Assert(result.RemotePath == "/apps/demo/upload.txt", "上传结果路径不正确。");
+        Assert(!result.UsedRapidUpload, "普通上传不应标记为秒传。");
+        Assert(progress.Last?.BytesCompleted == payload.Length, "上传最终进度不正确。");
+    }
+    finally
+    {
+        Directory.Delete(directory, recursive: true);
+    }
+}
+
+static async Task MissingUploadPartIsRetried()
+{
+    var payload = new byte[BaiduUploadOptions.DefaultChunkSize + 3];
+    Random.Shared.NextBytes(payload);
+    var directory = CreateTemporaryDirectory();
+    var localPath = Path.Combine(directory, "multi.bin");
+    await File.WriteAllBytesAsync(localPath, payload);
+    var uploadAttempts = 0;
+    var service = CreateUploadService(request =>
+    {
+        var method = QueryValue(request.RequestUri!, "method");
+        if (method == "precreate")
+        {
+            var form = ParseForm(request.Content!);
+            var hashes = JsonSerializer.Deserialize<string[]>(form["block_list"]);
+            Assert(hashes?.Length == 2, "大文件没有按 4 MiB 分片。");
+            return Json(HttpStatusCode.OK,
+                """{"errno":0,"request_id":1,"uploadid":"upload-2","block_list":[1]}""");
+        }
+
+        if (method == "locateupload")
+        {
+            return Json(HttpStatusCode.OK,
+                """{"errno":0,"servers":[{"server":"https://c2.pcs.baidu.com"}]}""");
+        }
+
+        if (method == "upload")
+        {
+            uploadAttempts++;
+            Assert(QueryValue(request.RequestUri!, "partseq") == "1", "上传了非缺失分片。");
+            if (uploadAttempts == 1)
+            {
+                return Json(HttpStatusCode.ServiceUnavailable,
+                    """{"errno":-1,"errmsg":"temporary"}""");
+            }
+
+            return HandleUploadPart(request, payload[^3..], expectedPartIndex: 1);
+        }
+
+        if (method == "create")
+        {
+            return HandleCreate(request, "server-md5", payload.Length, 7002);
+        }
+
+        throw new InvalidOperationException($"未知上传调用：{method}");
+    });
+
+    try
+    {
+        var result = await service.UploadFileAsync(
+            "access-value",
+            localPath,
+            "/apps/demo/multi.bin");
+        Assert(uploadAttempts == 2, "临时错误后没有重试一次。");
+        Assert(result.SizeBytes == payload.Length, "多分片上传大小不正确。");
+    }
+    finally
+    {
+        Directory.Delete(directory, recursive: true);
+    }
+}
+
+static async Task EmptyFileUsesRapidUpload()
+{
+    var directory = CreateTemporaryDirectory();
+    var localPath = Path.Combine(directory, "empty.txt");
+    await File.WriteAllBytesAsync(localPath, Array.Empty<byte>());
+    var calls = new List<string>();
+    var emptyMd5 = "d41d8cd98f00b204e9800998ecf8427e";
+    var service = CreateUploadService(request =>
+    {
+        var method = QueryValue(request.RequestUri!, "method")!;
+        calls.Add(method);
+        if (method == "precreate")
+        {
+            return HandlePrecreate(request, emptyMd5, 0, []);
+        }
+
+        if (method == "create")
+        {
+            return HandleCreate(request, emptyMd5, 0, 7003);
+        }
+
+        throw new InvalidOperationException("秒传不应请求上传域名或发送分片。");
+    });
+
+    try
+    {
+        var result = await service.UploadFileAsync(
+            "access-value",
+            localPath,
+            "/apps/demo/empty.txt");
+        Assert(result.UsedRapidUpload, "空文件未使用秒传流程。");
+        Assert(calls.SequenceEqual(new[] { "precreate", "create" }), "秒传调用顺序不正确。");
+    }
+    finally
+    {
+        Directory.Delete(directory, recursive: true);
+    }
+}
+
+static async Task UploadIsRestrictedToAppRoot()
+{
+    var directory = CreateTemporaryDirectory();
+    var localPath = Path.Combine(directory, "local.txt");
+    await File.WriteAllTextAsync(localPath, "content");
+    var requestCount = 0;
+    var service = CreateUploadService(_ =>
+    {
+        requestCount++;
+        return Json(HttpStatusCode.OK, "{}");
+    });
+
+    try
+    {
+        await AssertThrowsAsync<ArgumentException>(() =>
+            service.UploadFileAsync("access-value", localPath, "/outside/local.txt"));
+        await AssertThrowsAsync<ArgumentException>(() =>
+            service.UploadFileAsync("access-value", localPath, "/apps/demo/../escape.txt"));
+        Assert(requestCount == 0, "非法远程路径不应发起网络请求。");
+    }
+    finally
+    {
+        Directory.Delete(directory, recursive: true);
+    }
+}
+
+static async Task UntrustedUploadHostIsRejected()
+{
+    var directory = CreateTemporaryDirectory();
+    var localPath = Path.Combine(directory, "local.txt");
+    await File.WriteAllTextAsync(localPath, "content");
+    var service = CreateUploadService(request =>
+    {
+        var method = QueryValue(request.RequestUri!, "method");
+        return method switch
+        {
+            "precreate" => Json(HttpStatusCode.OK,
+                """{"errno":0,"uploadid":"upload-4","block_list":[0]}"""),
+            "locateupload" => Json(HttpStatusCode.OK,
+                """{"errno":0,"servers":[{"server":"https://malicious.example/upload"}]}"""),
+            _ => throw new InvalidOperationException("不可信域名不应收到分片或创建请求。")
+        };
+    });
+
+    try
+    {
+        await AssertThrowsAsync<BaiduNetdiskApiException>(() =>
+            service.UploadFileAsync("access-value", localPath, "/apps/demo/local.txt"));
+    }
+    finally
+    {
+        Directory.Delete(directory, recursive: true);
+    }
+}
+
 static BaiduOAuthClient CreateOAuthClient(Func<HttpRequestMessage, HttpResponseMessage> responseFactory)
 {
     var options = new BaiduOAuthOptions
@@ -437,6 +645,94 @@ static BaiduDownloadService CreateDownloadService(Func<HttpRequestMessage, HttpR
 {
     var httpClient = new HttpClient(new StubHandler(responseFactory));
     return new BaiduDownloadService(httpClient, new BaiduNetdiskClient(httpClient));
+}
+
+static BaiduUploadService CreateUploadService(Func<HttpRequestMessage, HttpResponseMessage> responseFactory)
+{
+    var httpClient = new HttpClient(new StubHandler(responseFactory));
+    return new BaiduUploadService(httpClient, new BaiduUploadOptions { AppRoot = "/apps/demo" });
+}
+
+static HttpResponseMessage HandlePrecreate(
+    HttpRequestMessage request,
+    string expectedMd5,
+    int expectedSize,
+    int[] requestedParts)
+{
+    Assert(request.Method == HttpMethod.Post, "预创建必须使用 POST。");
+    Assert(QueryValue(request.RequestUri!, "openapi") == "xpansdk", "预创建缺少 openapi 标记。");
+    var form = ParseForm(request.Content!);
+    Assert(form["path"] == "/apps/demo/upload.txt" ||
+           form["path"] == "/apps/demo/empty.txt", "预创建远程路径不正确。");
+    Assert(form["size"] == expectedSize.ToString(), "预创建文件大小不正确。");
+    Assert(form["content-md5"] == expectedMd5, "预创建文件 MD5 不正确。");
+    Assert(form["rtype"] == "1", "默认重名策略应为重命名。");
+    return Json(HttpStatusCode.OK, $$"""
+        {"errno":0,"request_id":1,"uploadid":"upload-1","block_list":{{JsonSerializer.Serialize(requestedParts)}}}
+        """);
+}
+
+static HttpResponseMessage HandleUploadPart(
+    HttpRequestMessage request,
+    byte[] expectedPayload,
+    int expectedPartIndex)
+{
+    Assert(request.RequestUri?.Host.EndsWith(".pcs.baidu.com", StringComparison.Ordinal) == true,
+        "没有使用 locateupload 返回的上传域名。");
+    Assert(QueryValue(request.RequestUri!, "openapi") == "xpansdk", "分片请求缺少 openapi 标记。");
+    Assert(QueryValue(request.RequestUri!, "partseq") == expectedPartIndex.ToString(), "分片序号不正确。");
+    var multipart = request.Content!.ReadAsByteArrayAsync().GetAwaiter().GetResult();
+    Assert(ContainsSequence(multipart, expectedPayload), "multipart 请求不包含预期分片内容。");
+    return Json(HttpStatusCode.OK, """{"errno":0,"md5":"cloud-part-md5"}""");
+}
+
+static HttpResponseMessage HandleCreate(
+    HttpRequestMessage request,
+    string md5,
+    int size,
+    long fileSystemId)
+{
+    Assert(QueryValue(request.RequestUri!, "openapi") == "xpansdk", "最终创建缺少 openapi 标记。");
+    var form = ParseForm(request.Content!);
+    Assert(form["uploadid"] == "upload-1" || form["uploadid"] == "upload-2",
+        "最终创建 uploadid 不正确。");
+    Assert(form["block_list"].StartsWith("[", StringComparison.Ordinal), "最终创建缺少 block_list。");
+    return Json(HttpStatusCode.OK, $$"""
+        {"errno":0,"fs_id":{{fileSystemId}},"path":"{{form["path"]}}","size":{{size}},"md5":"{{md5}}"}
+        """);
+}
+
+static Dictionary<string, string> ParseForm(HttpContent content) =>
+    content.ReadAsStringAsync().GetAwaiter().GetResult()
+        .Split('&', StringSplitOptions.RemoveEmptyEntries)
+        .Select(segment => segment.Split('=', 2))
+        .ToDictionary(
+            pair => WebUtility.UrlDecode(pair[0]),
+            pair => WebUtility.UrlDecode(pair.Length == 1 ? string.Empty : pair[1]),
+            StringComparer.Ordinal);
+
+static string? QueryValue(Uri uri, string name)
+{
+    foreach (var segment in uri.Query.TrimStart('?').Split('&', StringSplitOptions.RemoveEmptyEntries))
+    {
+        var pair = segment.Split('=', 2);
+        if (string.Equals(Uri.UnescapeDataString(pair[0]), name, StringComparison.Ordinal))
+        {
+            return Uri.UnescapeDataString(pair.Length == 1 ? string.Empty : pair[1]);
+        }
+    }
+
+    return null;
+}
+
+static bool ContainsSequence(byte[] source, byte[] expected)
+{
+    if (expected.Length == 0)
+    {
+        return true;
+    }
+
+    return source.AsSpan().IndexOf(expected) >= 0;
 }
 
 static HttpResponseMessage MetadataResponse(long fileSystemId, int size, string md5) =>
@@ -517,4 +813,11 @@ file sealed class RecordingProgress : IProgress<BaiduDownloadProgress>
 file sealed class CallbackProgress(Action<BaiduDownloadProgress> callback) : IProgress<BaiduDownloadProgress>
 {
     public void Report(BaiduDownloadProgress value) => callback(value);
+}
+
+file sealed class RecordingUploadProgress : IProgress<BaiduUploadProgress>
+{
+    public BaiduUploadProgress? Last { get; private set; }
+
+    public void Report(BaiduUploadProgress value) => Last = value;
 }
