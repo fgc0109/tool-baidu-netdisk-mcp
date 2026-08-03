@@ -6,6 +6,7 @@ using BaiduNetdisk.Api;
 using BaiduNetdisk.Download;
 using BaiduNetdisk.OAuth;
 using BaiduNetdisk.Storage;
+using BaiduNetdisk.Upload;
 
 Console.OutputEncoding = Encoding.UTF8;
 return await BaiduCli.RunAsync(args);
@@ -48,6 +49,7 @@ internal static class BaiduCli
                 "search" => await SearchFilesAsync(netdisk, tokenStore, commandArgs),
                 "meta" => await ShowMetadataAsync(netdisk, tokenStore, commandArgs),
                 "download" => await DownloadFileAsync(downloader, tokenStore, commandArgs),
+                "upload" => await UploadFileAsync(httpClient, tokenStore, commandArgs),
                 _ => throw new ArgumentException($"未知命令：{command}")
             };
         }
@@ -311,6 +313,57 @@ internal static class BaiduCli
         }
     }
 
+    private static async Task<int> UploadFileAsync(
+        HttpClient httpClient,
+        FileTokenStore tokenStore,
+        string[] args)
+    {
+        var localPath = GetOption(args, "--local")
+            ?? throw new ArgumentException("请提供 --local <本地文件路径>。");
+        var remotePath = GetOption(args, "--remote")
+            ?? throw new ArgumentException("请提供 --remote <网盘文件路径>。");
+        var appRoot = Environment.GetEnvironmentVariable("BAIDU_APP_ROOT")
+            ?? throw new InvalidOperationException(
+                "上传前请设置 BAIDU_APP_ROOT，例如 /apps/你的应用名。");
+        var conflictPolicy = ParseUploadConflictPolicy(
+            GetOption(args, "--on-conflict") ?? "rename");
+        var uploader = new BaiduUploadService(
+            httpClient,
+            new BaiduUploadOptions { AppRoot = appRoot });
+        var token = await RequireTokenAsync(tokenStore);
+        using var cancellation = new CancellationTokenSource();
+        var reporter = new ConsoleUploadProgress();
+        ConsoleCancelEventHandler cancelHandler = (_, eventArgs) =>
+        {
+            eventArgs.Cancel = true;
+            cancellation.Cancel();
+        };
+
+        Console.CancelKeyPress += cancelHandler;
+        try
+        {
+            var result = await uploader.UploadFileAsync(
+                token.AccessToken,
+                localPath,
+                remotePath,
+                conflictPolicy,
+                reporter,
+                cancellation.Token);
+            reporter.Complete();
+            Console.WriteLine($"上传完成: {result.RemotePath}");
+            Console.WriteLine($"文件标识: {result.FileSystemId}");
+            Console.WriteLine($"文件大小: {FormatBytes(result.SizeBytes)} ({result.SizeBytes} bytes)");
+            Console.WriteLine($"MD5     : {result.Md5 ?? "(未返回)"}");
+            Console.WriteLine($"服务端秒传: {(result.UsedRapidUpload ? "是" : "否")}");
+            return 0;
+        }
+        finally
+        {
+            Console.CancelKeyPress -= cancelHandler;
+            reporter.Complete();
+        }
+    }
+
     private static BaiduOAuthOptions ReadOptions() => new()
     {
         ClientId = Environment.GetEnvironmentVariable("BAIDU_CLIENT_ID") ?? string.Empty,
@@ -396,6 +449,16 @@ internal static class BaiduCli
         _ => throw new ArgumentException("--order 只支持 name、time 或 size。")
     };
 
+    private static BaiduUploadConflictPolicy ParseUploadConflictPolicy(string value) =>
+        value.ToLowerInvariant() switch
+        {
+            "rename" => BaiduUploadConflictPolicy.Rename,
+            "rename-if-different" => BaiduUploadConflictPolicy.RenameIfDifferent,
+            "overwrite" => BaiduUploadConflictPolicy.Overwrite,
+            _ => throw new ArgumentException(
+                "--on-conflict 只支持 rename、rename-if-different 或 overwrite。")
+        };
+
     private static long[] ParseFileSystemIds(string value)
     {
         var segments = value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
@@ -473,6 +536,7 @@ internal static class BaiduCli
               BAIDU_REDIRECT_URI   可选，默认 oob
               BAIDU_OAUTH_SCOPE    可选，默认 "basic netdisk"
               BAIDU_TOKEN_FILE     可选，Token 保存路径
+              BAIDU_APP_ROOT       upload 必填，例如 /apps/你的应用名
 
             命令：
               auth-url [--state <值>] [--force-login]
@@ -488,6 +552,8 @@ internal static class BaiduCli
                      [--page-size <数量>] [--current-dir-only]
               meta --fs-id <ID[,ID...]>
               download --fs-id <ID> --output <本地文件路径> [--overwrite]
+              upload --local <本地文件路径> --remote <应用目录内网盘路径>
+                     [--on-conflict rename|rename-if-different|overwrite]
             """);
     }
 
@@ -509,6 +575,31 @@ internal static class BaiduCli
             var percentage = value.Percentage is null ? "--.--%" : $"{value.Percentage:P2}";
             Console.Write(
                 $"\r下载中: {FormatBytes(value.BytesReceived)} / {FormatBytes(value.TotalBytes)} ({percentage})");
+            _hasWritten = true;
+        }
+
+        public void Complete()
+        {
+            if (!_hasWritten)
+            {
+                return;
+            }
+
+            Console.WriteLine();
+            _hasWritten = false;
+        }
+    }
+
+    private sealed class ConsoleUploadProgress : IProgress<BaiduUploadProgress>
+    {
+        private bool _hasWritten;
+
+        public void Report(BaiduUploadProgress value)
+        {
+            var percentage = value.Percentage is null ? "--.--%" : $"{value.Percentage:P2}";
+            Console.Write(
+                $"\r上传中: {FormatBytes(value.BytesCompleted)} / {FormatBytes(value.TotalBytes)} " +
+                $"({percentage})，分片 {value.PartsCompleted}/{value.TotalParts}");
             _hasWritten = true;
         }
 

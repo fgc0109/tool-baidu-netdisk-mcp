@@ -1,6 +1,6 @@
 # 百度网盘 C# 工具
 
-当前完成 OAuth 2.0 授权码流程以及账号、容量查询。项目使用 .NET 8，不依赖第三方 NuGet 包。
+当前完成 OAuth 2.0 授权码流程以及账号、文件查询、下载和上传。项目使用 .NET 8，不依赖第三方 NuGet 包。
 
 已支持：
 
@@ -9,7 +9,9 @@
 - 刷新 Access Token；
 - 原子写入本地 Token 文件，控制台仅显示脱敏 Token；
 - 解析授权码或完整回调 URL，并处理百度 OAuth 错误响应；
-- 查询授权用户信息和网盘容量。
+- 查询授权用户信息和网盘容量；
+- 浏览、搜索和下载文件；
+- 在应用目录内完成流式分片上传、秒传及失败重试。
 
 ## 1. 准备百度应用
 
@@ -27,6 +29,7 @@ PowerShell：
 $env:BAIDU_CLIENT_ID = "你的 API Key"
 $env:BAIDU_CLIENT_SECRET = "你的 Secret Key"
 $env:BAIDU_REDIRECT_URI = "oob"
+$env:BAIDU_APP_ROOT = "/apps/你的应用名"
 ```
 
 默认权限为 `basic netdisk`。如果你的网盘应用后台或文档要求逗号分隔，可以覆盖：
@@ -123,6 +126,27 @@ dotnet run --project src/BaiduNetdisk.Cli -- download --fs-id "123456789" --outp
 ```
 
 目标目录必须已经存在。Access Token 只会被附加到百度可信 HTTPS 下载域名，不会发送给任意第三方地址。
+
+## 7. 上传文件
+
+`BAIDU_APP_ROOT` 必须与百度开放平台分配给应用的目录一致。远程目标必须是该目录下的绝对文件路径：
+
+```powershell
+$env:BAIDU_APP_ROOT = "/apps/你的应用名"
+dotnet run --project src/BaiduNetdisk.Cli -- upload `
+  --local "D:\Uploads\example.zip" `
+  --remote "/apps/你的应用名/example.zip"
+```
+
+上传使用固定 4 MiB 分片，依次执行预创建、上传服务定位、缺失分片传输和最终创建。文件按流读取，不会整体载入内存；临时网络或服务端错误会自动重试，按 Ctrl+C 可以取消。
+
+同名文件默认自动改名，避免覆盖已有内容。可通过 `--on-conflict` 显式选择策略：
+
+- `rename`：重名时自动改名，也是默认值；
+- `rename-if-different`：分片列表不同时自动改名；
+- `overwrite`：覆盖同名文件，只有明确传入时启用。
+
+上传服务只接受 `/apps/{应用名}/` 下的目标，并只信任百度 HTTPS 上传域名。配置缺失、越界路径及不可信上传地址都会在传输前或最终创建前被拒绝。
 
 ## 开发计划
 
