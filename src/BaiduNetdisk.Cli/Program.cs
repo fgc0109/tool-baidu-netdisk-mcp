@@ -34,6 +34,7 @@ internal static class BaiduCli
                 Timeout = TimeSpan.FromSeconds(30)
             };
             var oauth = new BaiduOAuthClient(httpClient, options);
+            using var authenticatedSession = new BaiduAuthenticatedSession(oauth, tokenStore);
             var netdisk = new BaiduNetdiskClient(httpClient);
             var downloader = new BaiduDownloadService(httpClient, netdisk);
 
@@ -44,18 +45,18 @@ internal static class BaiduCli
                 "exchange" => await ExchangeAsync(oauth, tokenStore, commandArgs),
                 "refresh" => await RefreshAsync(oauth, tokenStore, commandArgs),
                 "show" => await ShowAsync(tokenStore),
-                "account" => await ShowAccountAsync(netdisk, tokenStore),
-                "quota" => await ShowQuotaAsync(netdisk, tokenStore),
-                "ls" => await ListFilesAsync(netdisk, tokenStore, commandArgs),
-                "search" => await SearchFilesAsync(netdisk, tokenStore, commandArgs),
-                "meta" => await ShowMetadataAsync(netdisk, tokenStore, commandArgs),
-                "download" => await DownloadFileAsync(downloader, tokenStore, commandArgs),
-                "upload" => await UploadFileAsync(httpClient, tokenStore, commandArgs),
-                "mkdir" => await CreateDirectoryAsync(httpClient, tokenStore, commandArgs),
-                "copy" => await TransferFilesAsync(httpClient, tokenStore, commandArgs, move: false),
-                "move" => await TransferFilesAsync(httpClient, tokenStore, commandArgs, move: true),
-                "rename" => await RenameFileAsync(httpClient, tokenStore, commandArgs),
-                "delete" => await DeleteFilesAsync(httpClient, tokenStore, commandArgs),
+                "account" => await ShowAccountAsync(netdisk, authenticatedSession),
+                "quota" => await ShowQuotaAsync(netdisk, authenticatedSession),
+                "ls" => await ListFilesAsync(netdisk, authenticatedSession, commandArgs),
+                "search" => await SearchFilesAsync(netdisk, authenticatedSession, commandArgs),
+                "meta" => await ShowMetadataAsync(netdisk, authenticatedSession, commandArgs),
+                "download" => await DownloadFileAsync(downloader, authenticatedSession, commandArgs),
+                "upload" => await UploadFileAsync(httpClient, authenticatedSession, commandArgs),
+                "mkdir" => await CreateDirectoryAsync(httpClient, authenticatedSession, commandArgs),
+                "copy" => await TransferFilesAsync(httpClient, authenticatedSession, commandArgs, move: false),
+                "move" => await TransferFilesAsync(httpClient, authenticatedSession, commandArgs, move: true),
+                "rename" => await RenameFileAsync(httpClient, authenticatedSession, commandArgs),
+                "delete" => await DeleteFilesAsync(httpClient, authenticatedSession, commandArgs),
                 _ => throw new ArgumentException($"未知命令：{command}")
             };
         }
@@ -63,6 +64,11 @@ internal static class BaiduCli
         {
             Console.Error.WriteLine("操作已取消。");
             return 2;
+        }
+        catch (BaiduReauthorizationRequiredException exception)
+        {
+            Console.Error.WriteLine($"授权失效：{exception.Message}");
+            return 3;
         }
         catch (Exception exception) when (exception is ArgumentException or InvalidOperationException or BaiduOAuthException or BaiduNetdiskApiException or IOException or UnauthorizedAccessException or HttpRequestException)
         {
@@ -150,10 +156,11 @@ internal static class BaiduCli
 
     private static async Task<int> ShowAccountAsync(
         BaiduNetdiskClient netdisk,
-        FileTokenStore tokenStore)
+        BaiduAuthenticatedSession authenticatedSession)
     {
-        var token = await RequireTokenAsync(tokenStore);
-        var user = await netdisk.GetUserInfoAsync(token.AccessToken);
+        var user = await authenticatedSession.ExecuteAsync(
+            (accessToken, cancellationToken) =>
+                netdisk.GetUserInfoAsync(accessToken, cancellationToken));
 
         Console.WriteLine($"百度名称: {user.BaiduName ?? "(未返回)"}");
         Console.WriteLine($"网盘名称: {user.NetdiskName ?? "(未返回)"}");
@@ -165,10 +172,11 @@ internal static class BaiduCli
 
     private static async Task<int> ShowQuotaAsync(
         BaiduNetdiskClient netdisk,
-        FileTokenStore tokenStore)
+        BaiduAuthenticatedSession authenticatedSession)
     {
-        var token = await RequireTokenAsync(tokenStore);
-        var quota = await netdisk.GetQuotaAsync(token.AccessToken);
+        var quota = await authenticatedSession.ExecuteAsync(
+            (accessToken, cancellationToken) =>
+                netdisk.GetQuotaAsync(accessToken, cancellationToken));
 
         Console.WriteLine($"总容量 : {FormatBytes(quota.TotalBytes)} ({quota.TotalBytes} bytes)");
         Console.WriteLine($"已使用 : {FormatBytes(quota.UsedBytes)} ({quota.UsedBytes} bytes)");
@@ -177,28 +185,25 @@ internal static class BaiduCli
         return 0;
     }
 
-    private static async Task<BaiduTokenSet> RequireTokenAsync(FileTokenStore tokenStore) =>
-        await tokenStore.LoadAsync()
-        ?? throw new InvalidOperationException("没有找到已保存的 Token，请先执行 login。");
-
     private static async Task<int> ListFilesAsync(
         BaiduNetdiskClient netdisk,
-        FileTokenStore tokenStore,
+        BaiduAuthenticatedSession authenticatedSession,
         string[] args)
     {
-        var token = await RequireTokenAsync(tokenStore);
         var directory = GetOption(args, "--dir") ?? "/";
         var start = GetIntOption(args, "--start", 0);
         var limit = GetIntOption(args, "--limit", 100);
         var order = ParseFileOrder(GetOption(args, "--order") ?? "name");
-        var page = await netdisk.ListFilesAsync(
-            token.AccessToken,
-            directory,
-            start,
-            limit,
-            order,
-            descending: HasFlag(args, "--desc"),
-            foldersOnly: HasFlag(args, "--folders-only"));
+        var page = await authenticatedSession.ExecuteAsync(
+            (accessToken, cancellationToken) => netdisk.ListFilesAsync(
+                accessToken,
+                directory,
+                start,
+                limit,
+                order,
+                descending: HasFlag(args, "--desc"),
+                foldersOnly: HasFlag(args, "--folders-only"),
+                cancellationToken: cancellationToken));
 
         PrintFileEntries(page.Items);
         Console.WriteLine($"返回 {page.Items.Count} 项；下一页 start={start + page.Items.Count}");
@@ -207,22 +212,23 @@ internal static class BaiduCli
 
     private static async Task<int> SearchFilesAsync(
         BaiduNetdiskClient netdisk,
-        FileTokenStore tokenStore,
+        BaiduAuthenticatedSession authenticatedSession,
         string[] args)
     {
         var keyword = GetOption(args, "--key")
             ?? throw new ArgumentException("请提供 --key <搜索关键词>。");
-        var token = await RequireTokenAsync(tokenStore);
         var directory = GetOption(args, "--dir") ?? "/";
         var pageNumber = GetIntOption(args, "--page", 1);
         var pageSize = GetIntOption(args, "--page-size", 100);
-        var result = await netdisk.SearchFilesAsync(
-            token.AccessToken,
-            keyword,
-            directory,
-            pageNumber,
-            pageSize,
-            recursive: !HasFlag(args, "--current-dir-only"));
+        var result = await authenticatedSession.ExecuteAsync(
+            (accessToken, cancellationToken) => netdisk.SearchFilesAsync(
+                accessToken,
+                keyword,
+                directory,
+                pageNumber,
+                pageSize,
+                recursive: !HasFlag(args, "--current-dir-only"),
+                cancellationToken: cancellationToken));
 
         PrintFileEntries(result.Items);
         Console.WriteLine($"返回 {result.Items.Count} 项；下一页 page={pageNumber + 1}");
@@ -231,13 +237,14 @@ internal static class BaiduCli
 
     private static async Task<int> ShowMetadataAsync(
         BaiduNetdiskClient netdisk,
-        FileTokenStore tokenStore,
+        BaiduAuthenticatedSession authenticatedSession,
         string[] args)
     {
         var ids = ParseFileSystemIds(GetOption(args, "--fs-id")
             ?? throw new ArgumentException("请提供 --fs-id <ID[,ID...]>。"));
-        var token = await RequireTokenAsync(tokenStore);
-        var result = await netdisk.GetFileMetadataAsync(token.AccessToken, ids);
+        var result = await authenticatedSession.ExecuteAsync(
+            (accessToken, cancellationToken) =>
+                netdisk.GetFileMetadataAsync(accessToken, ids, cancellationToken: cancellationToken));
 
         if (result.Items.Count == 0)
         {
@@ -275,7 +282,7 @@ internal static class BaiduCli
 
     private static async Task<int> DownloadFileAsync(
         BaiduDownloadService downloader,
-        FileTokenStore tokenStore,
+        BaiduAuthenticatedSession authenticatedSession,
         string[] args)
     {
         var ids = ParseFileSystemIds(GetOption(args, "--fs-id")
@@ -287,7 +294,6 @@ internal static class BaiduCli
 
         var outputPath = GetOption(args, "--output")
             ?? throw new ArgumentException("请提供 --output <本地文件路径>。");
-        var token = await RequireTokenAsync(tokenStore);
         using var cancellation = new CancellationTokenSource();
         var reporter = new ConsoleDownloadProgress();
         ConsoleCancelEventHandler cancelHandler = (_, eventArgs) =>
@@ -299,13 +305,15 @@ internal static class BaiduCli
         Console.CancelKeyPress += cancelHandler;
         try
         {
-            var result = await downloader.DownloadByFileSystemIdAsync(
-                token.AccessToken,
-                ids[0],
-                outputPath,
-                overwrite: HasFlag(args, "--overwrite"),
-                progress: reporter,
-                cancellationToken: cancellation.Token);
+            var result = await authenticatedSession.ExecuteAsync(
+                (accessToken, cancellationToken) => downloader.DownloadByFileSystemIdAsync(
+                    accessToken,
+                    ids[0],
+                    outputPath,
+                    overwrite: HasFlag(args, "--overwrite"),
+                    progress: reporter,
+                    cancellationToken: cancellationToken),
+                cancellation.Token);
             reporter.Complete();
             Console.WriteLine($"下载完成: {result.DestinationPath}");
             Console.WriteLine($"文件大小: {FormatBytes(result.BytesWritten)} ({result.BytesWritten} bytes)");
@@ -321,7 +329,7 @@ internal static class BaiduCli
 
     private static async Task<int> UploadFileAsync(
         HttpClient httpClient,
-        FileTokenStore tokenStore,
+        BaiduAuthenticatedSession authenticatedSession,
         string[] args)
     {
         var localPath = GetOption(args, "--local")
@@ -336,7 +344,6 @@ internal static class BaiduCli
         var uploader = new BaiduUploadService(
             httpClient,
             new BaiduUploadOptions { AppRoot = appRoot });
-        var token = await RequireTokenAsync(tokenStore);
         using var cancellation = new CancellationTokenSource();
         var reporter = new ConsoleUploadProgress();
         ConsoleCancelEventHandler cancelHandler = (_, eventArgs) =>
@@ -348,12 +355,14 @@ internal static class BaiduCli
         Console.CancelKeyPress += cancelHandler;
         try
         {
-            var result = await uploader.UploadFileAsync(
-                token.AccessToken,
-                localPath,
-                remotePath,
-                conflictPolicy,
-                reporter,
+            var result = await authenticatedSession.ExecuteAsync(
+                (accessToken, cancellationToken) => uploader.UploadFileAsync(
+                    accessToken,
+                    localPath,
+                    remotePath,
+                    conflictPolicy,
+                    reporter,
+                    cancellationToken),
                 cancellation.Token);
             reporter.Complete();
             Console.WriteLine($"上传完成: {result.RemotePath}");
@@ -372,15 +381,16 @@ internal static class BaiduCli
 
     private static async Task<int> CreateDirectoryAsync(
         HttpClient httpClient,
-        FileTokenStore tokenStore,
+        BaiduAuthenticatedSession authenticatedSession,
         string[] args)
     {
         var path = GetOption(args, "--path")
             ?? throw new ArgumentException("请提供 --path <网盘目录路径>。");
         var conflictPolicy = ParseFileConflictPolicy(GetOption(args, "--on-conflict") ?? "fail");
         var service = CreateManagementService(httpClient);
-        var token = await RequireTokenAsync(tokenStore);
-        var result = await service.CreateDirectoryAsync(token.AccessToken, path, conflictPolicy);
+        var result = await authenticatedSession.ExecuteAsync(
+            (accessToken, cancellationToken) =>
+                service.CreateDirectoryAsync(accessToken, path, conflictPolicy, cancellationToken));
         Console.WriteLine($"目录已创建: {result.Path}");
         Console.WriteLine($"文件标识: {result.FileSystemId}");
         return 0;
@@ -388,7 +398,7 @@ internal static class BaiduCli
 
     private static async Task<int> TransferFilesAsync(
         HttpClient httpClient,
-        FileTokenStore tokenStore,
+        BaiduAuthenticatedSession authenticatedSession,
         string[] args,
         bool move)
     {
@@ -411,16 +421,16 @@ internal static class BaiduCli
             .ToArray();
         var conflictPolicy = ParseFileConflictPolicy(GetOption(args, "--on-conflict") ?? "fail");
         var service = CreateManagementService(httpClient);
-        var token = await RequireTokenAsync(tokenStore);
-        var result = move
-            ? await service.MoveAsync(token.AccessToken, requests, conflictPolicy)
-            : await service.CopyAsync(token.AccessToken, requests, conflictPolicy);
+        var result = await authenticatedSession.ExecuteAsync(
+            (accessToken, cancellationToken) => move
+                ? service.MoveAsync(accessToken, requests, conflictPolicy, cancellationToken)
+                : service.CopyAsync(accessToken, requests, conflictPolicy, cancellationToken));
         return PrintBatchResult(result);
     }
 
     private static async Task<int> RenameFileAsync(
         HttpClient httpClient,
-        FileTokenStore tokenStore,
+        BaiduAuthenticatedSession authenticatedSession,
         string[] args)
     {
         var path = GetOption(args, "--path")
@@ -428,16 +438,17 @@ internal static class BaiduCli
         var newName = GetOption(args, "--name")
             ?? throw new ArgumentException("请提供 --name <新名称>。");
         var service = CreateManagementService(httpClient);
-        var token = await RequireTokenAsync(tokenStore);
-        var result = await service.RenameAsync(
-            token.AccessToken,
-            new[] { new BaiduFileRenameRequest(path, newName) });
+        var result = await authenticatedSession.ExecuteAsync(
+            (accessToken, cancellationToken) => service.RenameAsync(
+                accessToken,
+                new[] { new BaiduFileRenameRequest(path, newName) },
+                cancellationToken));
         return PrintBatchResult(result);
     }
 
     private static async Task<int> DeleteFilesAsync(
         HttpClient httpClient,
-        FileTokenStore tokenStore,
+        BaiduAuthenticatedSession authenticatedSession,
         string[] args)
     {
         var paths = GetOptions(args, "--path");
@@ -452,11 +463,12 @@ internal static class BaiduCli
         }
 
         var service = CreateManagementService(httpClient);
-        var token = await RequireTokenAsync(tokenStore);
-        var result = await service.DeleteAsync(
-            token.AccessToken,
-            paths,
-            confirmDelete: true);
+        var result = await authenticatedSession.ExecuteAsync(
+            (accessToken, cancellationToken) => service.DeleteAsync(
+                accessToken,
+                paths,
+                confirmDelete: true,
+                cancellationToken));
         return PrintBatchResult(result);
     }
 

@@ -190,6 +190,25 @@ dotnet run --project src/BaiduNetdisk.Cli -- delete `
 
 删除会进入百度网盘的服务端删除流程；工具不会在缺少 `--confirm` 时发送请求。应用目录本身及其外部路径不能被这些命令修改。
 
+## 9. Token 自动刷新
+
+除 `auth-url`、`login`、`exchange`、`refresh` 和 `show` 外，所有 API 命令都通过统一的认证会话取得 Access Token：
+
+- Access Token 距离过期不足 5 分钟时，在 API 调用前自动刷新；
+- 同一进程中的并发调用共享一次刷新，不会同时重复请求 OAuth 服务；
+- 刷新成功后，通过原子替换更新 Token 文件；
+- 网盘返回鉴权错误 `-6`，或通用 OpenAPI 返回 `110/111` 时，刷新一次并重试原调用；
+- 临时网络或 OAuth 服务错误不会覆盖当前 Token 文件；
+- Refresh Token 失效、撤销或应用凭据不匹配时，命令以退出码 `3` 结束并提示重新执行 `login`。
+
+自动刷新时需要 `BAIDU_CLIENT_ID` 和 `BAIDU_CLIENT_SECRET`。如果只设置了这些变量的某一个 PowerShell 窗口，请确保实际运行命令的窗口也设置了它们。仍可手动强制刷新：
+
+```powershell
+dotnet run --project src/BaiduNetdisk.Cli -- refresh
+```
+
+`show` 只展示本地保存的脱敏 Token 状态，不会主动刷新或发起网络请求。
+
 ## 开发计划
 
 完整的功能边界、验收条件和提交拆分见 [需求文档](docs/requirements.md)。
