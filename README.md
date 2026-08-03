@@ -148,6 +148,48 @@ dotnet run --project src/BaiduNetdisk.Cli -- upload `
 
 上传服务只接受 `/apps/{应用名}/` 下的目标，并只信任百度 HTTPS 上传域名。配置缺失、越界路径及不可信上传地址都会在传输前或最终创建前被拒绝。
 
+## 8. 管理文件
+
+所有写操作都受 `BAIDU_APP_ROOT` 限制。创建目录：
+
+```powershell
+dotnet run --project src/BaiduNetdisk.Cli -- mkdir --path "/apps/你的应用名/archive"
+```
+
+复制或移动文件；重复传入 `--source` 可以执行最多 100 项的批量操作：
+
+```powershell
+dotnet run --project src/BaiduNetdisk.Cli -- copy `
+  --source "/apps/你的应用名/a.txt" `
+  --source "/apps/你的应用名/b.txt" `
+  --dest "/apps/你的应用名/archive"
+
+dotnet run --project src/BaiduNetdisk.Cli -- move `
+  --source "/apps/你的应用名/draft.txt" `
+  --dest "/apps/你的应用名/archive" `
+  --new-name "final.txt"
+```
+
+默认同名策略是 `fail`，不会隐式覆盖或改名。需要自动改名或覆盖时，分别显式传入 `--on-conflict rename` 或 `--on-conflict overwrite`。批量操作会逐项输出结果，部分失败时命令返回非零退出码。
+
+重命名文件：
+
+```powershell
+dotnet run --project src/BaiduNetdisk.Cli -- rename `
+  --path "/apps/你的应用名/old.txt" `
+  --name "new.txt"
+```
+
+删除必须显式传入 `--confirm`，并且支持重复的 `--path`：
+
+```powershell
+dotnet run --project src/BaiduNetdisk.Cli -- delete `
+  --path "/apps/你的应用名/obsolete.txt" `
+  --confirm
+```
+
+删除会进入百度网盘的服务端删除流程；工具不会在缺少 `--confirm` 时发送请求。应用目录本身及其外部路径不能被这些命令修改。
+
 ## 开发计划
 
 完整的功能边界、验收条件和提交拆分见 [需求文档](docs/requirements.md)。

@@ -4,6 +4,7 @@ using System.Security.Cryptography;
 using System.Text;
 using BaiduNetdisk.Api;
 using BaiduNetdisk.Download;
+using BaiduNetdisk.Management;
 using BaiduNetdisk.OAuth;
 using BaiduNetdisk.Storage;
 using BaiduNetdisk.Upload;
@@ -50,6 +51,11 @@ internal static class BaiduCli
                 "meta" => await ShowMetadataAsync(netdisk, tokenStore, commandArgs),
                 "download" => await DownloadFileAsync(downloader, tokenStore, commandArgs),
                 "upload" => await UploadFileAsync(httpClient, tokenStore, commandArgs),
+                "mkdir" => await CreateDirectoryAsync(httpClient, tokenStore, commandArgs),
+                "copy" => await TransferFilesAsync(httpClient, tokenStore, commandArgs, move: false),
+                "move" => await TransferFilesAsync(httpClient, tokenStore, commandArgs, move: true),
+                "rename" => await RenameFileAsync(httpClient, tokenStore, commandArgs),
+                "delete" => await DeleteFilesAsync(httpClient, tokenStore, commandArgs),
                 _ => throw new ArgumentException($"未知命令：{command}")
             };
         }
@@ -364,6 +370,132 @@ internal static class BaiduCli
         }
     }
 
+    private static async Task<int> CreateDirectoryAsync(
+        HttpClient httpClient,
+        FileTokenStore tokenStore,
+        string[] args)
+    {
+        var path = GetOption(args, "--path")
+            ?? throw new ArgumentException("请提供 --path <网盘目录路径>。");
+        var conflictPolicy = ParseFileConflictPolicy(GetOption(args, "--on-conflict") ?? "fail");
+        var service = CreateManagementService(httpClient);
+        var token = await RequireTokenAsync(tokenStore);
+        var result = await service.CreateDirectoryAsync(token.AccessToken, path, conflictPolicy);
+        Console.WriteLine($"目录已创建: {result.Path}");
+        Console.WriteLine($"文件标识: {result.FileSystemId}");
+        return 0;
+    }
+
+    private static async Task<int> TransferFilesAsync(
+        HttpClient httpClient,
+        FileTokenStore tokenStore,
+        string[] args,
+        bool move)
+    {
+        var sourcePaths = GetOptions(args, "--source");
+        if (sourcePaths.Count == 0)
+        {
+            throw new ArgumentException("请至少提供一个 --source <网盘路径>。");
+        }
+
+        var destination = GetOption(args, "--dest")
+            ?? throw new ArgumentException("请提供 --dest <目标目录>。");
+        var newName = GetOption(args, "--new-name");
+        if (newName is not null && sourcePaths.Count != 1)
+        {
+            throw new ArgumentException("--new-name 只能与单个 --source 一起使用。");
+        }
+
+        var requests = sourcePaths
+            .Select(path => new BaiduFileTransferRequest(path, destination, newName))
+            .ToArray();
+        var conflictPolicy = ParseFileConflictPolicy(GetOption(args, "--on-conflict") ?? "fail");
+        var service = CreateManagementService(httpClient);
+        var token = await RequireTokenAsync(tokenStore);
+        var result = move
+            ? await service.MoveAsync(token.AccessToken, requests, conflictPolicy)
+            : await service.CopyAsync(token.AccessToken, requests, conflictPolicy);
+        return PrintBatchResult(result);
+    }
+
+    private static async Task<int> RenameFileAsync(
+        HttpClient httpClient,
+        FileTokenStore tokenStore,
+        string[] args)
+    {
+        var path = GetOption(args, "--path")
+            ?? throw new ArgumentException("请提供 --path <网盘路径>。");
+        var newName = GetOption(args, "--name")
+            ?? throw new ArgumentException("请提供 --name <新名称>。");
+        var service = CreateManagementService(httpClient);
+        var token = await RequireTokenAsync(tokenStore);
+        var result = await service.RenameAsync(
+            token.AccessToken,
+            new[] { new BaiduFileRenameRequest(path, newName) });
+        return PrintBatchResult(result);
+    }
+
+    private static async Task<int> DeleteFilesAsync(
+        HttpClient httpClient,
+        FileTokenStore tokenStore,
+        string[] args)
+    {
+        var paths = GetOptions(args, "--path");
+        if (paths.Count == 0)
+        {
+            throw new ArgumentException("请至少提供一个 --path <网盘路径>。");
+        }
+
+        if (!HasFlag(args, "--confirm"))
+        {
+            throw new InvalidOperationException("删除属于破坏性操作，请显式传入 --confirm。");
+        }
+
+        var service = CreateManagementService(httpClient);
+        var token = await RequireTokenAsync(tokenStore);
+        var result = await service.DeleteAsync(
+            token.AccessToken,
+            paths,
+            confirmDelete: true);
+        return PrintBatchResult(result);
+    }
+
+    private static BaiduFileManagementService CreateManagementService(HttpClient httpClient)
+    {
+        var appRoot = Environment.GetEnvironmentVariable("BAIDU_APP_ROOT")
+            ?? throw new InvalidOperationException(
+                "文件管理前请设置 BAIDU_APP_ROOT，例如 /apps/你的应用名。");
+        return new BaiduFileManagementService(
+            httpClient,
+            new BaiduFileManagementOptions { AppRoot = appRoot });
+    }
+
+    private static int PrintBatchResult(BaiduBatchOperationResult result)
+    {
+        foreach (var item in result.Items)
+        {
+            if (item.Success)
+            {
+                var destination = item.DestinationPath is null
+                    ? string.Empty
+                    : $" -> {item.DestinationPath}";
+                Console.WriteLine($"成功: {item.SourcePath}{destination}");
+            }
+            else
+            {
+                Console.Error.WriteLine(
+                    $"失败: {item.SourcePath} (errno={item.ErrorCode}, {item.ErrorMessage ?? "未返回错误信息"})");
+            }
+        }
+
+        if (!string.IsNullOrWhiteSpace(result.RequestId))
+        {
+            Console.WriteLine($"Request ID: {result.RequestId}");
+        }
+
+        return result.Success ? 0 : 1;
+    }
+
     private static BaiduOAuthOptions ReadOptions() => new()
     {
         ClientId = Environment.GetEnvironmentVariable("BAIDU_CLIENT_ID") ?? string.Empty,
@@ -459,6 +591,15 @@ internal static class BaiduCli
                 "--on-conflict 只支持 rename、rename-if-different 或 overwrite。")
         };
 
+    private static BaiduFileConflictPolicy ParseFileConflictPolicy(string value) =>
+        value.ToLowerInvariant() switch
+        {
+            "fail" => BaiduFileConflictPolicy.Fail,
+            "rename" => BaiduFileConflictPolicy.Rename,
+            "overwrite" => BaiduFileConflictPolicy.Overwrite,
+            _ => throw new ArgumentException("--on-conflict 只支持 fail、rename 或 overwrite。")
+        };
+
     private static long[] ParseFileSystemIds(string value)
     {
         var segments = value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
@@ -492,6 +633,27 @@ internal static class BaiduCli
         }
 
         return null;
+    }
+
+    private static IReadOnlyList<string> GetOptions(string[] args, string name)
+    {
+        var values = new List<string>();
+        for (var index = 0; index < args.Length; index++)
+        {
+            if (!string.Equals(args[index], name, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            if (index + 1 >= args.Length || args[index + 1].StartsWith("--", StringComparison.Ordinal))
+            {
+                throw new ArgumentException($"参数 {name} 缺少值。");
+            }
+
+            values.Add(args[++index]);
+        }
+
+        return values;
     }
 
     private static int GetIntOption(string[] args, string name, int defaultValue)
@@ -536,7 +698,7 @@ internal static class BaiduCli
               BAIDU_REDIRECT_URI   可选，默认 oob
               BAIDU_OAUTH_SCOPE    可选，默认 "basic netdisk"
               BAIDU_TOKEN_FILE     可选，Token 保存路径
-              BAIDU_APP_ROOT       upload 必填，例如 /apps/你的应用名
+              BAIDU_APP_ROOT       upload 和文件管理必填，例如 /apps/你的应用名
 
             命令：
               auth-url [--state <值>] [--force-login]
@@ -554,6 +716,13 @@ internal static class BaiduCli
               download --fs-id <ID> --output <本地文件路径> [--overwrite]
               upload --local <本地文件路径> --remote <应用目录内网盘路径>
                      [--on-conflict rename|rename-if-different|overwrite]
+              mkdir --path <应用目录内路径> [--on-conflict fail|rename|overwrite]
+              copy --source <路径> [--source <路径>...] --dest <目标目录>
+                   [--new-name <新名称>] [--on-conflict fail|rename|overwrite]
+              move --source <路径> [--source <路径>...] --dest <目标目录>
+                   [--new-name <新名称>] [--on-conflict fail|rename|overwrite]
+              rename --path <路径> --name <新名称>
+              delete --path <路径> [--path <路径>...] --confirm
             """);
     }
 
