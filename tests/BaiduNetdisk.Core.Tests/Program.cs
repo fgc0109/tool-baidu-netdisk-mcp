@@ -1,6 +1,8 @@
 using System.Net;
+using System.Security.Cryptography;
 using System.Text;
 using BaiduNetdisk.Api;
+using BaiduNetdisk.Download;
 using BaiduNetdisk.OAuth;
 
 var tests = new (string Name, Func<Task> Run)[]
@@ -17,7 +19,11 @@ var tests = new (string Name, Func<Task> Run)[]
     ("空目录返回空集合", EmptyDirectoryIsParsed),
     ("按特殊字符关键词搜索", FileSearchIsEncoded),
     ("批量读取文件元数据", FileMetadataIsParsed),
-    ("拒绝无效文件查询参数", InvalidFileArgumentsAreRejected)
+    ("拒绝无效文件查询参数", InvalidFileArgumentsAreRejected),
+    ("流式下载并校验文件", FileDownloadIsVerified),
+    ("默认拒绝覆盖文件", ExistingDownloadIsPreserved),
+    ("校验失败时清理临时文件", InvalidDownloadIsCleanedUp),
+    ("取消下载时清理临时文件", CancelledDownloadIsCleanedUp)
 };
 
 var failures = 0;
@@ -287,6 +293,133 @@ static Task InvalidFileArgumentsAreRejected()
     return Task.CompletedTask;
 }
 
+static async Task FileDownloadIsVerified()
+{
+    var payload = Encoding.UTF8.GetBytes("hello from baidu netdisk");
+    var md5 = Convert.ToHexString(MD5.HashData(payload)).ToLowerInvariant();
+    HttpRequestMessage? downloadRequest = null;
+    var client = CreateDownloadService(request =>
+    {
+        if (request.RequestUri?.Host == "pan.baidu.com")
+        {
+            return MetadataResponse(501, payload.Length, md5);
+        }
+
+        downloadRequest = request;
+        return Bytes(HttpStatusCode.OK, payload);
+    });
+    var directory = CreateTemporaryDirectory();
+    var destination = Path.Combine(directory, "download.txt");
+    var progress = new RecordingProgress();
+
+    try
+    {
+        var result = await client.DownloadByFileSystemIdAsync(
+            "access-value",
+            501,
+            destination,
+            progress: progress);
+
+        Assert(File.ReadAllBytes(destination).SequenceEqual(payload), "下载文件内容不正确。");
+        Assert(result.BytesWritten == payload.Length, "下载字节数不正确。");
+        Assert(result.Md5 == md5, "下载 MD5 不正确。");
+        Assert(downloadRequest?.Headers.UserAgent.ToString() == "pan.baidu.com", "下载 User-Agent 不正确。");
+        Assert(downloadRequest?.RequestUri?.Query.Contains("access_token=access-value", StringComparison.Ordinal) == true,
+            "下载地址没有附加 Access Token。");
+        Assert(progress.Last?.BytesReceived == payload.Length, "没有报告最终下载进度。");
+    }
+    finally
+    {
+        Directory.Delete(directory, recursive: true);
+    }
+}
+
+static async Task ExistingDownloadIsPreserved()
+{
+    var requestCount = 0;
+    var client = CreateDownloadService(_ =>
+    {
+        requestCount++;
+        return Json(HttpStatusCode.OK, "{}");
+    });
+    var directory = CreateTemporaryDirectory();
+    var destination = Path.Combine(directory, "existing.txt");
+    await File.WriteAllTextAsync(destination, "original");
+
+    try
+    {
+        await AssertThrowsAsync<IOException>(() =>
+            client.DownloadByFileSystemIdAsync("access-value", 501, destination));
+        Assert(await File.ReadAllTextAsync(destination) == "original", "已有文件被修改。");
+        Assert(requestCount == 0, "发现目标已存在后不应发起网络请求。");
+    }
+    finally
+    {
+        Directory.Delete(directory, recursive: true);
+    }
+}
+
+static async Task InvalidDownloadIsCleanedUp()
+{
+    var payload = Encoding.UTF8.GetBytes("corrupted");
+    var client = CreateDownloadService(request =>
+        request.RequestUri?.Host == "pan.baidu.com"
+            ? MetadataResponse(502, payload.Length, "00000000000000000000000000000000")
+            : Bytes(HttpStatusCode.OK, payload));
+    var directory = CreateTemporaryDirectory();
+    var destination = Path.Combine(directory, "invalid.bin");
+
+    try
+    {
+        await AssertThrowsAsync<BaiduDownloadIntegrityException>(() =>
+            client.DownloadByFileSystemIdAsync("access-value", 502, destination));
+        Assert(!File.Exists(destination), "校验失败后不应生成目标文件。");
+        Assert(Directory.GetFiles(directory, "*.partial").Length == 0, "校验失败后残留临时文件。");
+    }
+    finally
+    {
+        Directory.Delete(directory, recursive: true);
+    }
+}
+
+static async Task CancelledDownloadIsCleanedUp()
+{
+    var payload = new byte[300_000];
+    Random.Shared.NextBytes(payload);
+    var md5 = Convert.ToHexString(MD5.HashData(payload)).ToLowerInvariant();
+    var client = CreateDownloadService(request =>
+        request.RequestUri?.Host == "pan.baidu.com"
+            ? MetadataResponse(503, payload.Length, md5)
+            : Bytes(HttpStatusCode.OK, payload));
+    var directory = CreateTemporaryDirectory();
+    var destination = Path.Combine(directory, "cancelled.bin");
+    using var cancellation = new CancellationTokenSource();
+    var progress = new CallbackProgress(value =>
+    {
+        if (value.BytesReceived > 0)
+        {
+            cancellation.Cancel();
+        }
+    });
+
+    try
+    {
+        await AssertThrowsAsync<OperationCanceledException>(() =>
+            client.DownloadByFileSystemIdAsync(
+                "access-value",
+                503,
+                destination,
+                progress: progress,
+                cancellationToken: cancellation.Token));
+        Assert(!File.Exists(destination), "取消后不应生成目标文件。");
+        Assert(Directory.GetFiles(directory, "*.partial").Length == 0, "取消后残留临时文件。");
+    }
+    finally
+    {
+        Directory.Delete(directory, recursive: true);
+    }
+}
+
 static BaiduOAuthClient CreateOAuthClient(Func<HttpRequestMessage, HttpResponseMessage> responseFactory)
 {
     var options = new BaiduOAuthOptions
@@ -299,6 +432,29 @@ static BaiduOAuthClient CreateOAuthClient(Func<HttpRequestMessage, HttpResponseM
 
 static BaiduNetdiskClient CreateNetdiskClient(Func<HttpRequestMessage, HttpResponseMessage> responseFactory) =>
     new(new HttpClient(new StubHandler(responseFactory)));
+
+static BaiduDownloadService CreateDownloadService(Func<HttpRequestMessage, HttpResponseMessage> responseFactory)
+{
+    var httpClient = new HttpClient(new StubHandler(responseFactory));
+    return new BaiduDownloadService(httpClient, new BaiduNetdiskClient(httpClient));
+}
+
+static HttpResponseMessage MetadataResponse(long fileSystemId, int size, string md5) =>
+    Json(HttpStatusCode.OK, $$"""
+        {"errno":0,"request_id":1,"list":[{"fs_id":{{fileSystemId}},"filename":"test.bin","path":"/test.bin","isdir":0,"size":{{size}},"md5":"{{md5}}","dlink":"https://d.pcs.baidu.com/file/test"}]}
+        """);
+
+static HttpResponseMessage Bytes(HttpStatusCode statusCode, byte[] content) => new(statusCode)
+{
+    Content = new ByteArrayContent(content)
+};
+
+static string CreateTemporaryDirectory()
+{
+    var path = Path.Combine(Path.GetTempPath(), $"baidu-netdisk-tests-{Guid.NewGuid():N}");
+    Directory.CreateDirectory(path);
+    return path;
+}
 
 static HttpResponseMessage Json(HttpStatusCode statusCode, string content) => new(statusCode)
 {
@@ -328,10 +484,37 @@ static void AssertThrows<TException>(Action action)
     throw new InvalidOperationException($"预期抛出 {typeof(TException).Name}。");
 }
 
+static async Task AssertThrowsAsync<TException>(Func<Task> action)
+    where TException : Exception
+{
+    try
+    {
+        await action();
+    }
+    catch (TException)
+    {
+        return;
+    }
+
+    throw new InvalidOperationException($"预期抛出 {typeof(TException).Name}。");
+}
+
 file sealed class StubHandler(Func<HttpRequestMessage, HttpResponseMessage> responseFactory) : HttpMessageHandler
 {
     protected override Task<HttpResponseMessage> SendAsync(
         HttpRequestMessage request,
         CancellationToken cancellationToken) =>
         Task.FromResult(responseFactory(request));
+}
+
+file sealed class RecordingProgress : IProgress<BaiduDownloadProgress>
+{
+    public BaiduDownloadProgress? Last { get; private set; }
+
+    public void Report(BaiduDownloadProgress value) => Last = value;
+}
+
+file sealed class CallbackProgress(Action<BaiduDownloadProgress> callback) : IProgress<BaiduDownloadProgress>
+{
+    public void Report(BaiduDownloadProgress value) => callback(value);
 }
