@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="src/BaiduNetdisk.Cli/BaiduNetdisk.Cli.csproj" />
+  <Project Path="tests/BaiduNetdisk.OAuth.Tests/BaiduNetdisk.OAuth.Tests.csproj" />
+</Solution>

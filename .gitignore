@@ -1,0 +1,11 @@
+bin/
+obj/
+.vs/
+.idea/
+.dotnet-home/
+*.user
+*.suo
+.env
+appsettings.local.json
+tokens.json
+*.tokens.json
