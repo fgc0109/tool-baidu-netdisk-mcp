@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using BaiduNetdisk.Serialization;
 
 namespace BaiduNetdisk.Api;
 
@@ -67,7 +68,16 @@ public sealed class BaiduNetdiskClient
 
         using (document)
         {
-            var envelope = document.RootElement.Deserialize<ApiEnvelope>(JsonOptions);
+            ApiEnvelope? envelope;
+            try
+            {
+                envelope = document.RootElement.Deserialize<ApiEnvelope>(JsonOptions);
+            }
+            catch (JsonException exception)
+            {
+                throw InvalidResponse(response, exception);
+            }
+
             if (!response.IsSuccessStatusCode || envelope is null || envelope.ErrorCode != 0)
             {
                 throw new BaiduNetdiskApiException(
@@ -77,7 +87,16 @@ public sealed class BaiduNetdiskClient
                     (int)response.StatusCode);
             }
 
-            var result = document.RootElement.Deserialize<T>(JsonOptions);
+            T? result;
+            try
+            {
+                result = document.RootElement.Deserialize<T>(JsonOptions);
+            }
+            catch (JsonException exception)
+            {
+                throw InvalidResponse(response, exception, envelope.RequestId);
+            }
+
             return result ?? throw new BaiduNetdiskApiException(
                 errorCode: -1,
                 errorMessage: "百度网盘 API 返回的数据为空。",
@@ -85,6 +104,17 @@ public sealed class BaiduNetdiskClient
                 statusCode: (int)response.StatusCode);
         }
     }
+
+    private static BaiduNetdiskApiException InvalidResponse(
+        HttpResponseMessage response,
+        JsonException exception,
+        string? requestId = null) =>
+        new(
+            errorCode: -1,
+            errorMessage: "百度网盘 API 返回的字段格式无法解析。",
+            requestId: requestId,
+            statusCode: (int)response.StatusCode,
+            innerException: exception);
 
     private static string RequireAccessToken(string accessToken) =>
         string.IsNullOrWhiteSpace(accessToken)
@@ -109,6 +139,7 @@ public sealed class BaiduNetdiskClient
         public string? ErrorMessage { get; init; }
 
         [JsonPropertyName("request_id")]
+        [JsonConverter(typeof(FlexibleStringJsonConverter))]
         public string? RequestId { get; init; }
     }
 }

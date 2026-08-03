@@ -1,6 +1,6 @@
 # 百度网盘 C# 工具
 
-当前完成第一阶段：百度 OAuth 2.0 授权码流程。项目使用 .NET 8，不依赖第三方 NuGet 包。
+当前完成 OAuth 2.0 授权码流程以及账号、容量查询。项目使用 .NET 8，不依赖第三方 NuGet 包。
 
 已支持：
 
@@ -8,7 +8,8 @@
 - 使用授权码换取 Access Token / Refresh Token；
 - 刷新 Access Token；
 - 原子写入本地 Token 文件，控制台仅显示脱敏 Token；
-- 解析授权码或完整回调 URL，并处理百度 OAuth 错误响应。
+- 解析授权码或完整回调 URL，并处理百度 OAuth 错误响应；
+- 查询授权用户信息和网盘容量。
 
 ## 1. 准备百度应用
 
@@ -60,6 +61,26 @@ dotnet run --project src/BaiduNetdisk.Cli -- show
 ```powershell
 dotnet run --project src/BaiduNetdisk.Cli -- exchange --code "https://example.com/callback?code=...&state=..." --state "之前的state"
 ```
+
+## 4. 查询账号状态
+
+完成一次登录授权后，查询账号资料：
+
+```powershell
+dotnet run --project src/BaiduNetdisk.Cli -- account
+```
+
+查询网盘总容量、已用容量和剩余容量：
+
+```powershell
+dotnet run --project src/BaiduNetdisk.Cli -- quota
+```
+
+这两个命令从本地 Token 文件读取 Access Token，不需要再次传入 API Key 或 Secret Key。
+
+## 开发计划
+
+完整的功能边界、验收条件和提交拆分见 [需求文档](docs/requirements.md)。
 
 ## 官方资料
 

@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Security.Cryptography;
+using BaiduNetdisk.Api;
 using BaiduNetdisk.OAuth;
 using BaiduNetdisk.Storage;
 
@@ -27,6 +28,7 @@ internal static class BaiduCli
                 Timeout = TimeSpan.FromSeconds(30)
             };
             var oauth = new BaiduOAuthClient(httpClient, options);
+            var netdisk = new BaiduNetdiskClient(httpClient);
 
             return command switch
             {
@@ -35,6 +37,8 @@ internal static class BaiduCli
                 "exchange" => await ExchangeAsync(oauth, tokenStore, commandArgs),
                 "refresh" => await RefreshAsync(oauth, tokenStore, commandArgs),
                 "show" => await ShowAsync(tokenStore),
+                "account" => await ShowAccountAsync(netdisk, tokenStore),
+                "quota" => await ShowQuotaAsync(netdisk, tokenStore),
                 _ => throw new ArgumentException($"未知命令：{command}")
             };
         }
@@ -43,7 +47,7 @@ internal static class BaiduCli
             Console.Error.WriteLine("操作已取消。");
             return 2;
         }
-        catch (Exception exception) when (exception is ArgumentException or InvalidOperationException or BaiduOAuthException or IOException or UnauthorizedAccessException or HttpRequestException)
+        catch (Exception exception) when (exception is ArgumentException or InvalidOperationException or BaiduOAuthException or BaiduNetdiskApiException or IOException or UnauthorizedAccessException or HttpRequestException)
         {
             Console.Error.WriteLine($"错误：{exception.Message}");
             return 1;
@@ -127,6 +131,39 @@ internal static class BaiduCli
         return 0;
     }
 
+    private static async Task<int> ShowAccountAsync(
+        BaiduNetdiskClient netdisk,
+        FileTokenStore tokenStore)
+    {
+        var token = await RequireTokenAsync(tokenStore);
+        var user = await netdisk.GetUserInfoAsync(token.AccessToken);
+
+        Console.WriteLine($"百度名称: {user.BaiduName ?? "(未返回)"}");
+        Console.WriteLine($"网盘名称: {user.NetdiskName ?? "(未返回)"}");
+        Console.WriteLine($"用户标识: {user.UserId}");
+        Console.WriteLine($"会员类型: {FormatVipType(user.VipType)}");
+        Console.WriteLine($"头像地址: {user.AvatarUrl ?? "(未返回)"}");
+        return 0;
+    }
+
+    private static async Task<int> ShowQuotaAsync(
+        BaiduNetdiskClient netdisk,
+        FileTokenStore tokenStore)
+    {
+        var token = await RequireTokenAsync(tokenStore);
+        var quota = await netdisk.GetQuotaAsync(token.AccessToken);
+
+        Console.WriteLine($"总容量 : {FormatBytes(quota.TotalBytes)} ({quota.TotalBytes} bytes)");
+        Console.WriteLine($"已使用 : {FormatBytes(quota.UsedBytes)} ({quota.UsedBytes} bytes)");
+        Console.WriteLine($"剩余   : {FormatBytes(quota.RemainingBytes)} ({quota.RemainingBytes} bytes)");
+        Console.WriteLine($"使用率 : {quota.UsedRatio:P2}");
+        return 0;
+    }
+
+    private static async Task<BaiduTokenSet> RequireTokenAsync(FileTokenStore tokenStore) =>
+        await tokenStore.LoadAsync()
+        ?? throw new InvalidOperationException("没有找到已保存的 Token，请先执行 login。");
+
     private static BaiduOAuthOptions ReadOptions() => new()
     {
         ClientId = Environment.GetEnvironmentVariable("BAIDU_CLIENT_ID") ?? string.Empty,
@@ -178,6 +215,28 @@ internal static class BaiduCli
     private static string Redact(string value) =>
         value.Length <= 12 ? "***" : $"{value[..6]}...{value[^4..]}";
 
+    private static string FormatVipType(int vipType) => vipType switch
+    {
+        0 => "普通用户",
+        1 => "会员",
+        2 => "超级会员",
+        _ => $"未知 ({vipType})"
+    };
+
+    private static string FormatBytes(long bytes)
+    {
+        string[] units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+        var value = (double)Math.Max(0, bytes);
+        var unitIndex = 0;
+        while (value >= 1024 && unitIndex < units.Length - 1)
+        {
+            value /= 1024;
+            unitIndex++;
+        }
+
+        return $"{value:0.##} {units[unitIndex]}";
+    }
+
     private static bool HasFlag(string[] args, string name) =>
         args.Any(arg => string.Equals(arg, name, StringComparison.OrdinalIgnoreCase));
 
@@ -222,7 +281,7 @@ internal static class BaiduCli
     private static void PrintHelp()
     {
         Console.WriteLine("""
-            百度网盘 OAuth 命令行工具
+            百度网盘命令行工具
 
             环境变量：
               BAIDU_CLIENT_ID      必填，应用 API Key
@@ -237,6 +296,8 @@ internal static class BaiduCli
               exchange --code <授权码或回调地址> [--state <期望值>]
               refresh [--refresh-token <值>]
               show
+              account
+              quota
             """);
     }
 }

@@ -143,7 +143,7 @@ static async Task UserInfoIsParsed()
 static async Task QuotaIsParsed()
 {
     var client = CreateNetdiskClient(_ => Json(HttpStatusCode.OK, """
-        {"errno":0,"errmsg":"succ","request_id":"req-2","total":1000,"used":250}
+        {"errno":0,"errmsg":"succ","request_id":42,"total":1000,"used":250}
         """));
 
     var quota = await client.GetQuotaAsync("access-value");
@@ -152,6 +152,7 @@ static async Task QuotaIsParsed()
     Assert(quota.UsedBytes == 250, "used 解析失败。");
     Assert(quota.RemainingBytes == 750, "剩余容量计算失败。");
     Assert(Math.Abs(quota.UsedRatio - 0.25) < 0.0001, "使用比例计算失败。");
+    Assert(quota.RequestId == "42", "数字 request_id 兼容失败。");
 }
 
 static async Task NetdiskErrorIsMapped()
