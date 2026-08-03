@@ -4,6 +4,7 @@ using System.Text;
 using System.Text.Json;
 using BaiduNetdisk.Api;
 using BaiduNetdisk.Download;
+using BaiduNetdisk.Management;
 using BaiduNetdisk.OAuth;
 using BaiduNetdisk.Upload;
 
@@ -30,7 +31,13 @@ var tests = new (string Name, Func<Task> Run)[]
     ("仅上传缺失分片并重试", MissingUploadPartIsRetried),
     ("空文件支持服务端秒传", EmptyFileUsesRapidUpload),
     ("上传严格限制应用目录", UploadIsRestrictedToAppRoot),
-    ("拒绝不可信上传域名", UntrustedUploadHostIsRejected)
+    ("拒绝不可信上传域名", UntrustedUploadHostIsRejected),
+    ("创建应用目录下的文件夹", DirectoryIsCreated),
+    ("批量复制保留逐项结果", CopyPreservesPerItemResults),
+    ("移动仅显式启用覆盖", MoveUsesExplicitOverwrite),
+    ("重命名发送安全文件名", RenameUsesLeafName),
+    ("删除要求显式确认", DeleteRequiresConfirmation),
+    ("文件管理严格限制应用目录", ManagementIsRestrictedToAppRoot)
 };
 
 var failures = 0;
@@ -628,6 +635,162 @@ static async Task UntrustedUploadHostIsRejected()
     }
 }
 
+static async Task DirectoryIsCreated()
+{
+    var service = CreateManagementService(request =>
+    {
+        Assert(QueryValue(request.RequestUri!, "method") == "create", "创建目录 method 不正确。");
+        var form = ParseForm(request.Content!);
+        Assert(form["path"] == "/apps/demo/reports", "创建目录路径不正确。");
+        Assert(form["isdir"] == "1", "创建目录必须设置 isdir=1。");
+        Assert(form["size"] == "0", "目录大小必须为 0。");
+        Assert(!form.ContainsKey("rtype"), "默认冲突失败时不应隐式改名或覆盖。");
+        return Json(HttpStatusCode.OK,
+            """{"errno":0,"request_id":11,"fs_id":101,"path":"/apps/demo/reports","server_filename":"reports","ctime":1700000000,"mtime":1700000001}""");
+    });
+
+    var result = await service.CreateDirectoryAsync("access-value", "/apps/demo/reports");
+    Assert(result.FileSystemId == 101, "创建目录 fs_id 不正确。");
+    Assert(result.Name == "reports", "创建目录名称不正确。");
+    Assert(result.CreatedAt == DateTimeOffset.FromUnixTimeSeconds(1700000000),
+        "创建时间不正确。");
+}
+
+static async Task CopyPreservesPerItemResults()
+{
+    var service = CreateManagementService(request =>
+    {
+        Assert(QueryValue(request.RequestUri!, "method") == "filemanager", "复制 method 不正确。");
+        Assert(QueryValue(request.RequestUri!, "opera") == "copy", "复制 opera 不正确。");
+        var form = ParseForm(request.Content!);
+        Assert(form["async"] == "0", "批量复制必须返回同步逐项结果。");
+        using var document = JsonDocument.Parse(form["filelist"]);
+        var entries = document.RootElement.EnumerateArray().ToArray();
+        Assert(entries.Length == 2, "批量复制项数不正确。");
+        Assert(entries[0].GetProperty("path").GetString() == "/apps/demo/a.txt", "复制源路径不正确。");
+        Assert(entries[0].GetProperty("dest").GetString() == "/apps/demo/archive", "复制目标目录不正确。");
+        Assert(entries[0].GetProperty("ondup").GetString() == "fail", "默认复制冲突策略应失败。");
+        return Json(HttpStatusCode.OK,
+            """{"errno":0,"request_id":"req-copy","info":[{"errno":0,"path":"/apps/demo/archive/a.txt"},{"errno":-8,"errmsg":"file exists","path":"/apps/demo/archive/b.txt"}]}""");
+    });
+
+    var result = await service.CopyAsync(
+        "access-value",
+        new[]
+        {
+            new BaiduFileTransferRequest("/apps/demo/a.txt", "/apps/demo/archive"),
+            new BaiduFileTransferRequest("/apps/demo/b.txt", "/apps/demo/archive")
+        });
+
+    Assert(!result.Success, "部分失败的批量复制不应报告整体成功。");
+    Assert(result.Items.Count == 2, "批量复制逐项结果数量不正确。");
+    Assert(result.Items[0].Success, "第一项复制应成功。");
+    Assert(result.Items[1].ErrorCode == -8 && result.Items[1].ErrorMessage == "file exists",
+        "第二项复制错误没有保留。");
+    Assert(result.RequestId == "req-copy", "批量复制 request_id 不正确。");
+}
+
+static async Task MoveUsesExplicitOverwrite()
+{
+    var service = CreateManagementService(request =>
+    {
+        Assert(QueryValue(request.RequestUri!, "opera") == "move", "移动 opera 不正确。");
+        var form = ParseForm(request.Content!);
+        using var document = JsonDocument.Parse(form["filelist"]);
+        var entry = document.RootElement[0];
+        Assert(entry.GetProperty("newname").GetString() == "renamed.txt", "移动新名称不正确。");
+        Assert(entry.GetProperty("ondup").GetString() == "overwrite", "没有显式传递覆盖策略。");
+        return Json(HttpStatusCode.OK,
+            """{"errno":0,"request_id":12,"info":[{"errno":0,"path":"/apps/demo/to/renamed.txt"}]}""");
+    });
+
+    var result = await service.MoveAsync(
+        "access-value",
+        new[] { new BaiduFileTransferRequest("/apps/demo/from/a.txt", "/apps/demo/to", "renamed.txt") },
+        BaiduFileConflictPolicy.Overwrite);
+    Assert(result.Success, "显式覆盖移动应成功。");
+    Assert(result.Items[0].DestinationPath == "/apps/demo/to/renamed.txt", "移动结果路径不正确。");
+}
+
+static async Task RenameUsesLeafName()
+{
+    var service = CreateManagementService(request =>
+    {
+        Assert(QueryValue(request.RequestUri!, "opera") == "rename", "重命名 opera 不正确。");
+        var form = ParseForm(request.Content!);
+        using var document = JsonDocument.Parse(form["filelist"]);
+        var entry = document.RootElement[0];
+        Assert(entry.GetProperty("path").GetString() == "/apps/demo/old.txt", "重命名源路径不正确。");
+        Assert(entry.GetProperty("newname").GetString() == "new.txt", "重命名目标名称不正确。");
+        Assert(!entry.TryGetProperty("dest", out _), "重命名不应携带目标目录。");
+        Assert(!entry.TryGetProperty("ondup", out _), "重命名不应隐式设置冲突策略。");
+        return Json(HttpStatusCode.OK,
+            """{"errno":0,"info":[{"errno":0,"path":"/apps/demo/new.txt"}]}""");
+    });
+
+    var result = await service.RenameAsync(
+        "access-value",
+        new[] { new BaiduFileRenameRequest("/apps/demo/old.txt", "new.txt") });
+    Assert(result.Success, "重命名应成功。");
+    Assert(result.Items[0].DestinationPath == "/apps/demo/new.txt", "重命名结果路径不正确。");
+    AssertThrows<ArgumentException>(() => service.RenameAsync(
+        "access-value",
+        new[] { new BaiduFileRenameRequest("/apps/demo/old.txt", "../escape.txt") }));
+}
+
+static async Task DeleteRequiresConfirmation()
+{
+    var requestCount = 0;
+    var service = CreateManagementService(request =>
+    {
+        requestCount++;
+        Assert(QueryValue(request.RequestUri!, "opera") == "delete", "删除 opera 不正确。");
+        var form = ParseForm(request.Content!);
+        using var document = JsonDocument.Parse(form["filelist"]);
+        Assert(document.RootElement.GetArrayLength() == 2, "批量删除项数不正确。");
+        Assert(document.RootElement[0].GetProperty("path").GetString() == "/apps/demo/a.txt",
+            "删除路径不正确。");
+        return Json(HttpStatusCode.OK,
+            """{"errno":0,"info":[{"errno":0},{"errno":0}]}""");
+    });
+
+    await AssertThrowsAsync<InvalidOperationException>(() => service.DeleteAsync(
+        "access-value",
+        new[] { "/apps/demo/a.txt" },
+        confirmDelete: false));
+    Assert(requestCount == 0, "未确认删除不应发起网络请求。");
+
+    var result = await service.DeleteAsync(
+        "access-value",
+        new[] { "/apps/demo/a.txt", "/apps/demo/b.txt" },
+        confirmDelete: true);
+    Assert(result.Success && requestCount == 1, "确认后的批量删除没有成功执行。");
+}
+
+static async Task ManagementIsRestrictedToAppRoot()
+{
+    var requestCount = 0;
+    var service = CreateManagementService(_ =>
+    {
+        requestCount++;
+        return Json(HttpStatusCode.OK, "{}");
+    });
+
+    await AssertThrowsAsync<ArgumentException>(() =>
+        service.CreateDirectoryAsync("access-value", "/outside/folder"));
+    await AssertThrowsAsync<ArgumentException>(() => service.CopyAsync(
+        "access-value",
+        new[] { new BaiduFileTransferRequest("/outside/a.txt", "/apps/demo") }));
+    await AssertThrowsAsync<ArgumentException>(() => service.MoveAsync(
+        "access-value",
+        new[] { new BaiduFileTransferRequest("/apps/demo/a.txt", "/outside") }));
+    await AssertThrowsAsync<ArgumentException>(() => service.DeleteAsync(
+        "access-value",
+        new[] { "/apps/demo/../outside.txt" },
+        confirmDelete: true));
+    Assert(requestCount == 0, "应用目录外的管理操作不应发起网络请求。");
+}
+
 static BaiduOAuthClient CreateOAuthClient(Func<HttpRequestMessage, HttpResponseMessage> responseFactory)
 {
     var options = new BaiduOAuthOptions
@@ -651,6 +814,15 @@ static BaiduUploadService CreateUploadService(Func<HttpRequestMessage, HttpRespo
 {
     var httpClient = new HttpClient(new StubHandler(responseFactory));
     return new BaiduUploadService(httpClient, new BaiduUploadOptions { AppRoot = "/apps/demo" });
+}
+
+static BaiduFileManagementService CreateManagementService(
+    Func<HttpRequestMessage, HttpResponseMessage> responseFactory)
+{
+    var httpClient = new HttpClient(new StubHandler(responseFactory));
+    return new BaiduFileManagementService(
+        httpClient,
+        new BaiduFileManagementOptions { AppRoot = "/apps/demo" });
 }
 
 static HttpResponseMessage HandlePrecreate(
