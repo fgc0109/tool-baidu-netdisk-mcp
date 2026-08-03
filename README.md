@@ -106,6 +106,24 @@ dotnet run --project src/BaiduNetdisk.Cli -- meta --fs-id "123456789,987654321"
 
 `ls`、`search` 和 `meta` 是只读命令，可以读取用户已授权的网盘路径。后续上传能力会按照百度开放平台要求限制到 `/apps/{应用名}`，不会把当前的读取范围误用为写入范围。
 
+## 6. 下载文件
+
+先通过 `ls` 或 `search` 取得文件的 `fs_id`，再下载到明确的本地文件路径：
+
+```powershell
+dotnet run --project src/BaiduNetdisk.Cli -- download --fs-id "123456789" --output "D:\Downloads\example.zip"
+```
+
+下载采用流式传输，不会把整个文件载入内存。程序会先写入目标目录中的随机 `.partial` 临时文件，完成大小和 MD5 校验后才移动到最终路径；失败或按 Ctrl+C 取消时会清理临时文件。
+
+默认禁止覆盖已有文件。如确实需要替换，必须显式传入：
+
+```powershell
+dotnet run --project src/BaiduNetdisk.Cli -- download --fs-id "123456789" --output "D:\Downloads\example.zip" --overwrite
+```
+
+目标目录必须已经存在。Access Token 只会被附加到百度可信 HTTPS 下载域名，不会发送给任意第三方地址。
+
 ## 开发计划
 
 完整的功能边界、验收条件和提交拆分见 [需求文档](docs/requirements.md)。

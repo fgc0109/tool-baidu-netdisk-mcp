@@ -3,6 +3,7 @@ using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
 using BaiduNetdisk.Api;
+using BaiduNetdisk.Download;
 using BaiduNetdisk.OAuth;
 using BaiduNetdisk.Storage;
 
@@ -32,6 +33,7 @@ internal static class BaiduCli
             };
             var oauth = new BaiduOAuthClient(httpClient, options);
             var netdisk = new BaiduNetdiskClient(httpClient);
+            var downloader = new BaiduDownloadService(httpClient, netdisk);
 
             return command switch
             {
@@ -45,6 +47,7 @@ internal static class BaiduCli
                 "ls" => await ListFilesAsync(netdisk, tokenStore, commandArgs),
                 "search" => await SearchFilesAsync(netdisk, tokenStore, commandArgs),
                 "meta" => await ShowMetadataAsync(netdisk, tokenStore, commandArgs),
+                "download" => await DownloadFileAsync(downloader, tokenStore, commandArgs),
                 _ => throw new ArgumentException($"未知命令：{command}")
             };
         }
@@ -262,6 +265,52 @@ internal static class BaiduCli
         }
     }
 
+    private static async Task<int> DownloadFileAsync(
+        BaiduDownloadService downloader,
+        FileTokenStore tokenStore,
+        string[] args)
+    {
+        var ids = ParseFileSystemIds(GetOption(args, "--fs-id")
+            ?? throw new ArgumentException("请提供 --fs-id <ID>。"));
+        if (ids.Length != 1)
+        {
+            throw new ArgumentException("download 命令一次只能下载一个 fs_id。");
+        }
+
+        var outputPath = GetOption(args, "--output")
+            ?? throw new ArgumentException("请提供 --output <本地文件路径>。");
+        var token = await RequireTokenAsync(tokenStore);
+        using var cancellation = new CancellationTokenSource();
+        var reporter = new ConsoleDownloadProgress();
+        ConsoleCancelEventHandler cancelHandler = (_, eventArgs) =>
+        {
+            eventArgs.Cancel = true;
+            cancellation.Cancel();
+        };
+
+        Console.CancelKeyPress += cancelHandler;
+        try
+        {
+            var result = await downloader.DownloadByFileSystemIdAsync(
+                token.AccessToken,
+                ids[0],
+                outputPath,
+                overwrite: HasFlag(args, "--overwrite"),
+                progress: reporter,
+                cancellationToken: cancellation.Token);
+            reporter.Complete();
+            Console.WriteLine($"下载完成: {result.DestinationPath}");
+            Console.WriteLine($"文件大小: {FormatBytes(result.BytesWritten)} ({result.BytesWritten} bytes)");
+            Console.WriteLine($"MD5     : {result.Md5}");
+            return 0;
+        }
+        finally
+        {
+            Console.CancelKeyPress -= cancelHandler;
+            reporter.Complete();
+        }
+    }
+
     private static BaiduOAuthOptions ReadOptions() => new()
     {
         ClientId = Environment.GetEnvironmentVariable("BAIDU_CLIENT_ID") ?? string.Empty,
@@ -438,6 +487,40 @@ internal static class BaiduCli
               search --key <关键词> [--dir <路径>] [--page <页码>]
                      [--page-size <数量>] [--current-dir-only]
               meta --fs-id <ID[,ID...]>
+              download --fs-id <ID> --output <本地文件路径> [--overwrite]
             """);
+    }
+
+    private sealed class ConsoleDownloadProgress : IProgress<BaiduDownloadProgress>
+    {
+        private readonly Stopwatch _stopwatch = Stopwatch.StartNew();
+        private long _lastReportMilliseconds = -1000;
+        private bool _hasWritten;
+
+        public void Report(BaiduDownloadProgress value)
+        {
+            if (value.BytesReceived < value.TotalBytes &&
+                _stopwatch.ElapsedMilliseconds - _lastReportMilliseconds < 250)
+            {
+                return;
+            }
+
+            _lastReportMilliseconds = _stopwatch.ElapsedMilliseconds;
+            var percentage = value.Percentage is null ? "--.--%" : $"{value.Percentage:P2}";
+            Console.Write(
+                $"\r下载中: {FormatBytes(value.BytesReceived)} / {FormatBytes(value.TotalBytes)} ({percentage})");
+            _hasWritten = true;
+        }
+
+        public void Complete()
+        {
+            if (!_hasWritten)
+            {
+                return;
+            }
+
+            Console.WriteLine();
+            _hasWritten = false;
+        }
     }
 }
