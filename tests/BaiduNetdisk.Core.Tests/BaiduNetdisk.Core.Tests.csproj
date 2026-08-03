@@ -4,6 +4,6 @@
     <TargetFramework>net8.0</TargetFramework>
   </PropertyGroup>
   <ItemGroup>
-    <ProjectReference Include="../../src/BaiduNetdisk.Cli/BaiduNetdisk.Cli.csproj" />
+    <ProjectReference Include="../../src/BaiduNetdisk.Core/BaiduNetdisk.Core.csproj" />
   </ItemGroup>
 </Project>

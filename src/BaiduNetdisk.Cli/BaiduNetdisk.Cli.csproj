@@ -5,4 +5,7 @@
     <RootNamespace>BaiduNetdisk</RootNamespace>
     <AssemblyName>baidu-netdisk</AssemblyName>
   </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../BaiduNetdisk.Core/BaiduNetdisk.Core.csproj" />
+  </ItemGroup>
 </Project>

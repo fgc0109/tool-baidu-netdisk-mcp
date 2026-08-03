@@ -1,5 +1,6 @@
 using System.Net;
 using System.Text;
+using BaiduNetdisk.Api;
 using BaiduNetdisk.OAuth;
 
 var tests = new (string Name, Func<Task> Run)[]
@@ -8,7 +9,10 @@ var tests = new (string Name, Func<Task> Run)[]
     ("回调地址校验 state", CallbackParserValidatesState),
     ("授权码可换取 Token", ExchangeCodeParsesToken),
     ("OAuth 错误被转换为异常", OAuthErrorIsMapped),
-    ("无效响应被转换为异常", InvalidResponseIsMapped)
+    ("无效响应被转换为异常", InvalidResponseIsMapped),
+    ("读取网盘用户信息", UserInfoIsParsed),
+    ("读取网盘容量", QuotaIsParsed),
+    ("网盘业务错误被转换为异常", NetdiskErrorIsMapped)
 };
 
 var failures = 0;
@@ -30,7 +34,7 @@ return failures == 0 ? 0 : 1;
 
 static Task AuthorizationUriContainsRequiredParameters()
 {
-    var client = CreateClient(_ => Json(HttpStatusCode.OK, "{}"));
+    var client = CreateOAuthClient(_ => Json(HttpStatusCode.OK, "{}"));
     var uri = client.BuildAuthorizationUri("state-value", forceLogin: true);
 
     Assert(uri.Scheme == Uri.UriSchemeHttps, "授权地址必须使用 HTTPS。");
@@ -60,7 +64,7 @@ static Task CallbackParserValidatesState()
 static async Task ExchangeCodeParsesToken()
 {
     Uri? requestUri = null;
-    var client = CreateClient(request =>
+    var client = CreateOAuthClient(request =>
     {
         requestUri = request.RequestUri;
         return Json(
@@ -83,7 +87,7 @@ static async Task ExchangeCodeParsesToken()
 
 static async Task OAuthErrorIsMapped()
 {
-    var client = CreateClient(_ => Json(
+    var client = CreateOAuthClient(_ => Json(
         HttpStatusCode.BadRequest,
         """{"error":"invalid_grant","error_description":"code expired"}"""));
 
@@ -102,7 +106,7 @@ static async Task OAuthErrorIsMapped()
 
 static async Task InvalidResponseIsMapped()
 {
-    var client = CreateClient(_ => Json(HttpStatusCode.OK, "not-json"));
+    var client = CreateOAuthClient(_ => Json(HttpStatusCode.OK, "not-json"));
 
     try
     {
@@ -115,7 +119,61 @@ static async Task InvalidResponseIsMapped()
     }
 }
 
-static BaiduOAuthClient CreateClient(Func<HttpRequestMessage, HttpResponseMessage> responseFactory)
+static async Task UserInfoIsParsed()
+{
+    Uri? requestUri = null;
+    var client = CreateNetdiskClient(request =>
+    {
+        requestUri = request.RequestUri;
+        return Json(HttpStatusCode.OK, """
+            {"errno":0,"errmsg":"succ","request_id":"req-1","baidu_name":"baidu-user","netdisk_name":"netdisk-user","avatar_url":"https://example.test/avatar","uk":123456,"vip_type":2}
+            """);
+    });
+
+    var user = await client.GetUserInfoAsync("access-value");
+
+    Assert(user.BaiduName == "baidu-user", "baidu_name 解析失败。");
+    Assert(user.NetdiskName == "netdisk-user", "netdisk_name 解析失败。");
+    Assert(user.UserId == 123456, "uk 解析失败。");
+    Assert(user.VipType == 2, "vip_type 解析失败。");
+    Assert(requestUri?.Query.Contains("method=uinfo", StringComparison.Ordinal) == true,
+        "用户信息请求缺少 method=uinfo。");
+}
+
+static async Task QuotaIsParsed()
+{
+    var client = CreateNetdiskClient(_ => Json(HttpStatusCode.OK, """
+        {"errno":0,"errmsg":"succ","request_id":"req-2","total":1000,"used":250}
+        """));
+
+    var quota = await client.GetQuotaAsync("access-value");
+
+    Assert(quota.TotalBytes == 1000, "total 解析失败。");
+    Assert(quota.UsedBytes == 250, "used 解析失败。");
+    Assert(quota.RemainingBytes == 750, "剩余容量计算失败。");
+    Assert(Math.Abs(quota.UsedRatio - 0.25) < 0.0001, "使用比例计算失败。");
+}
+
+static async Task NetdiskErrorIsMapped()
+{
+    var client = CreateNetdiskClient(_ => Json(HttpStatusCode.OK, """
+        {"errno":-6,"errmsg":"No permission","request_id":"req-error"}
+        """));
+
+    try
+    {
+        await client.GetUserInfoAsync("access-value");
+        throw new InvalidOperationException("预期抛出 BaiduNetdiskApiException。");
+    }
+    catch (BaiduNetdiskApiException exception)
+    {
+        Assert(exception.ErrorCode == -6, "errno 映射失败。");
+        Assert(exception.ErrorMessage == "No permission", "errmsg 映射失败。");
+        Assert(exception.RequestId == "req-error", "request_id 映射失败。");
+    }
+}
+
+static BaiduOAuthClient CreateOAuthClient(Func<HttpRequestMessage, HttpResponseMessage> responseFactory)
 {
     var options = new BaiduOAuthOptions
     {
@@ -124,6 +182,9 @@ static BaiduOAuthClient CreateClient(Func<HttpRequestMessage, HttpResponseMessag
     };
     return new BaiduOAuthClient(new HttpClient(new StubHandler(responseFactory)), options);
 }
+
+static BaiduNetdiskClient CreateNetdiskClient(Func<HttpRequestMessage, HttpResponseMessage> responseFactory) =>
+    new(new HttpClient(new StubHandler(responseFactory)));
 
 static HttpResponseMessage Json(HttpStatusCode statusCode, string content) => new(statusCode)
 {
