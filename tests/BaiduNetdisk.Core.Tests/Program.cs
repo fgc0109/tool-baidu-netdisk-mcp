@@ -12,7 +12,12 @@ var tests = new (string Name, Func<Task> Run)[]
     ("无效响应被转换为异常", InvalidResponseIsMapped),
     ("读取网盘用户信息", UserInfoIsParsed),
     ("读取网盘容量", QuotaIsParsed),
-    ("网盘业务错误被转换为异常", NetdiskErrorIsMapped)
+    ("网盘业务错误被转换为异常", NetdiskErrorIsMapped),
+    ("分页列出中文目录", FileListIsParsed),
+    ("空目录返回空集合", EmptyDirectoryIsParsed),
+    ("按特殊字符关键词搜索", FileSearchIsEncoded),
+    ("批量读取文件元数据", FileMetadataIsParsed),
+    ("拒绝无效文件查询参数", InvalidFileArgumentsAreRejected)
 };
 
 var failures = 0;
@@ -172,6 +177,114 @@ static async Task NetdiskErrorIsMapped()
         Assert(exception.ErrorMessage == "No permission", "errmsg 映射失败。");
         Assert(exception.RequestId == "req-error", "request_id 映射失败。");
     }
+}
+
+static async Task FileListIsParsed()
+{
+    Uri? requestUri = null;
+    var client = CreateNetdiskClient(request =>
+    {
+        requestUri = request.RequestUri;
+        return Json(HttpStatusCode.OK, """
+            {"errno":0,"request_id":101,"list":[{"fs_id":9001,"server_filename":"报告 & 计划.txt","path":"/资料/报告 & 计划.txt","isdir":0,"size":2048,"category":4,"server_mtime":1710000000},{"fs_id":9002,"server_filename":"子目录","path":"/资料/子目录","isdir":1,"size":0,"category":6}]}
+            """);
+    });
+
+    var page = await client.ListFilesAsync(
+        "access-value",
+        "/资料",
+        start: 20,
+        limit: 10,
+        order: BaiduFileOrder.Time,
+        descending: true);
+
+    Assert(page.Items.Count == 2, "文件列表数量不正确。");
+    Assert(page.Items[0].FileName == "报告 & 计划.txt", "中文文件名解析失败。");
+    Assert(page.Items[0].SizeBytes == 2048, "文件大小解析失败。");
+    Assert(!page.Items[0].IsDirectory && page.Items[1].IsDirectory, "目录标记解析失败。");
+    Assert(page.RequestId == "101", "列表 request_id 解析失败。");
+    Assert(requestUri?.Query.Contains("dir=%2F%E8%B5%84%E6%96%99", StringComparison.OrdinalIgnoreCase) == true,
+        "中文目录没有正确编码。");
+    Assert(requestUri?.Query.Contains("start=20", StringComparison.Ordinal) == true, "start 参数不正确。");
+    Assert(requestUri?.Query.Contains("limit=10", StringComparison.Ordinal) == true, "limit 参数不正确。");
+    Assert(requestUri?.Query.Contains("order=time", StringComparison.Ordinal) == true, "order 参数不正确。");
+    Assert(requestUri?.Query.Contains("desc=1", StringComparison.Ordinal) == true, "desc 参数不正确。");
+}
+
+static async Task EmptyDirectoryIsParsed()
+{
+    var client = CreateNetdiskClient(_ => Json(HttpStatusCode.OK, """
+        {"errno":0,"request_id":"empty","list":[]}
+        """));
+
+    var page = await client.ListFilesAsync("access-value", "/空目录");
+    Assert(page.Items.Count == 0, "空目录应返回空集合。");
+}
+
+static async Task FileSearchIsEncoded()
+{
+    Uri? requestUri = null;
+    var client = CreateNetdiskClient(request =>
+    {
+        requestUri = request.RequestUri;
+        return Json(HttpStatusCode.OK, """
+            {"errno":0,"request_id":"search","list":[{"fs_id":88,"server_filename":"预算 100%.xlsx","path":"/资料/预算 100%.xlsx","isdir":0,"size":10}]}
+            """);
+    });
+
+    var page = await client.SearchFilesAsync(
+        "access-value",
+        "预算 & 100%",
+        "/资料",
+        page: 2,
+        pageSize: 25,
+        recursive: false);
+
+    Assert(page.Items.Count == 1, "搜索结果解析失败。");
+    Assert(requestUri?.Query.Contains("key=%E9%A2%84%E7%AE%97%20%26%20100%25", StringComparison.OrdinalIgnoreCase) == true,
+        "搜索关键词没有正确编码。");
+    Assert(requestUri?.Query.Contains("page=2", StringComparison.Ordinal) == true, "page 参数不正确。");
+    Assert(requestUri?.Query.Contains("num=25", StringComparison.Ordinal) == true, "num 参数不正确。");
+    Assert(requestUri?.Query.Contains("recursion=0", StringComparison.Ordinal) == true,
+        "recursion 参数不正确。");
+}
+
+static async Task FileMetadataIsParsed()
+{
+    Uri? requestUri = null;
+    var client = CreateNetdiskClient(request =>
+    {
+        requestUri = request.RequestUri;
+        return Json(HttpStatusCode.OK, """
+            {"errno":0,"request_id":202,"list":[{"fs_id":11,"filename":"文件.txt","path":"/文件.txt","isdir":0,"size":123,"category":4,"md5":"abc123","dlink":"https://example.test/download","server_mtime":1710000000}]}
+            """);
+    });
+
+    var result = await client.GetFileMetadataAsync(
+        "access-value",
+        new long[] { 11, 22 },
+        includeDownloadLink: true);
+
+    Assert(result.Items.Count == 1, "元数据数量不正确。");
+    Assert(result.Items[0].FileName == "文件.txt", "元数据 filename 解析失败。");
+    Assert(result.Items[0].Md5 == "abc123", "MD5 解析失败。");
+    Assert(result.Items[0].DownloadLink == "https://example.test/download", "下载地址解析失败。");
+    Assert(requestUri?.Query.Contains("fsids=%5B11%2C22%5D", StringComparison.OrdinalIgnoreCase) == true,
+        "fsids 没有正确编码。");
+    Assert(requestUri?.Query.Contains("dlink=1", StringComparison.Ordinal) == true, "dlink 参数不正确。");
+}
+
+static Task InvalidFileArgumentsAreRejected()
+{
+    var client = CreateNetdiskClient(_ => Json(HttpStatusCode.OK, "{}"));
+    AssertThrows<ArgumentException>(() => client.ListFilesAsync("access-value", "relative/path"));
+    AssertThrows<ArgumentOutOfRangeException>(() =>
+        client.ListFilesAsync("access-value", "/", limit: 1001));
+    AssertThrows<ArgumentException>(() =>
+        client.SearchFilesAsync("access-value", " ", "/"));
+    AssertThrows<ArgumentOutOfRangeException>(() =>
+        client.GetFileMetadataAsync("access-value", Array.Empty<long>()));
+    return Task.CompletedTask;
 }
 
 static BaiduOAuthClient CreateOAuthClient(Func<HttpRequestMessage, HttpResponseMessage> responseFactory)
