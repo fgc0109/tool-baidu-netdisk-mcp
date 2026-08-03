@@ -78,6 +78,34 @@ dotnet run --project src/BaiduNetdisk.Cli -- quota
 
 这两个命令从本地 Token 文件读取 Access Token，不需要再次传入 API Key 或 Secret Key。
 
+## 5. 浏览与检索文件
+
+列出根目录：
+
+```powershell
+dotnet run --project src/BaiduNetdisk.Cli -- ls
+```
+
+分页列出指定目录，并按修改时间倒序：
+
+```powershell
+dotnet run --project src/BaiduNetdisk.Cli -- ls --dir "/资料" --start 0 --limit 100 --order time --desc
+```
+
+递归搜索文件名：
+
+```powershell
+dotnet run --project src/BaiduNetdisk.Cli -- search --key "报告" --dir "/"
+```
+
+根据列表或搜索结果中的 `fs_id` 查询详细元数据：
+
+```powershell
+dotnet run --project src/BaiduNetdisk.Cli -- meta --fs-id "123456789,987654321"
+```
+
+`ls`、`search` 和 `meta` 是只读命令，可以读取用户已授权的网盘路径。后续上传能力会按照百度开放平台要求限制到 `/apps/{应用名}`，不会把当前的读取范围误用为写入范围。
+
 ## 开发计划
 
 完整的功能边界、验收条件和提交拆分见 [需求文档](docs/requirements.md)。

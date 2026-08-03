@@ -1,9 +1,12 @@
 using System.Diagnostics;
+using System.Globalization;
 using System.Security.Cryptography;
+using System.Text;
 using BaiduNetdisk.Api;
 using BaiduNetdisk.OAuth;
 using BaiduNetdisk.Storage;
 
+Console.OutputEncoding = Encoding.UTF8;
 return await BaiduCli.RunAsync(args);
 
 internal static class BaiduCli
@@ -39,6 +42,9 @@ internal static class BaiduCli
                 "show" => await ShowAsync(tokenStore),
                 "account" => await ShowAccountAsync(netdisk, tokenStore),
                 "quota" => await ShowQuotaAsync(netdisk, tokenStore),
+                "ls" => await ListFilesAsync(netdisk, tokenStore, commandArgs),
+                "search" => await SearchFilesAsync(netdisk, tokenStore, commandArgs),
+                "meta" => await ShowMetadataAsync(netdisk, tokenStore, commandArgs),
                 _ => throw new ArgumentException($"未知命令：{command}")
             };
         }
@@ -164,6 +170,98 @@ internal static class BaiduCli
         await tokenStore.LoadAsync()
         ?? throw new InvalidOperationException("没有找到已保存的 Token，请先执行 login。");
 
+    private static async Task<int> ListFilesAsync(
+        BaiduNetdiskClient netdisk,
+        FileTokenStore tokenStore,
+        string[] args)
+    {
+        var token = await RequireTokenAsync(tokenStore);
+        var directory = GetOption(args, "--dir") ?? "/";
+        var start = GetIntOption(args, "--start", 0);
+        var limit = GetIntOption(args, "--limit", 100);
+        var order = ParseFileOrder(GetOption(args, "--order") ?? "name");
+        var page = await netdisk.ListFilesAsync(
+            token.AccessToken,
+            directory,
+            start,
+            limit,
+            order,
+            descending: HasFlag(args, "--desc"),
+            foldersOnly: HasFlag(args, "--folders-only"));
+
+        PrintFileEntries(page.Items);
+        Console.WriteLine($"返回 {page.Items.Count} 项；下一页 start={start + page.Items.Count}");
+        return 0;
+    }
+
+    private static async Task<int> SearchFilesAsync(
+        BaiduNetdiskClient netdisk,
+        FileTokenStore tokenStore,
+        string[] args)
+    {
+        var keyword = GetOption(args, "--key")
+            ?? throw new ArgumentException("请提供 --key <搜索关键词>。");
+        var token = await RequireTokenAsync(tokenStore);
+        var directory = GetOption(args, "--dir") ?? "/";
+        var pageNumber = GetIntOption(args, "--page", 1);
+        var pageSize = GetIntOption(args, "--page-size", 100);
+        var result = await netdisk.SearchFilesAsync(
+            token.AccessToken,
+            keyword,
+            directory,
+            pageNumber,
+            pageSize,
+            recursive: !HasFlag(args, "--current-dir-only"));
+
+        PrintFileEntries(result.Items);
+        Console.WriteLine($"返回 {result.Items.Count} 项；下一页 page={pageNumber + 1}");
+        return 0;
+    }
+
+    private static async Task<int> ShowMetadataAsync(
+        BaiduNetdiskClient netdisk,
+        FileTokenStore tokenStore,
+        string[] args)
+    {
+        var ids = ParseFileSystemIds(GetOption(args, "--fs-id")
+            ?? throw new ArgumentException("请提供 --fs-id <ID[,ID...]>。"));
+        var token = await RequireTokenAsync(tokenStore);
+        var result = await netdisk.GetFileMetadataAsync(token.AccessToken, ids);
+
+        if (result.Items.Count == 0)
+        {
+            Console.WriteLine("未找到文件元数据。");
+            return 0;
+        }
+
+        foreach (var item in result.Items)
+        {
+            Console.WriteLine($"{(item.IsDirectory ? "目录" : "文件")}: {item.Path}");
+            Console.WriteLine($"  fs_id : {item.FileSystemId}");
+            Console.WriteLine($"  大小  : {FormatBytes(item.SizeBytes)} ({item.SizeBytes} bytes)");
+            Console.WriteLine($"  MD5   : {item.Md5 ?? "(未返回)"}");
+            Console.WriteLine($"  修改  : {FormatTimestamp(item.ServerModifiedAt)}");
+        }
+
+        return 0;
+    }
+
+    private static void PrintFileEntries(IReadOnlyList<BaiduFileEntry> items)
+    {
+        if (items.Count == 0)
+        {
+            Console.WriteLine("未找到文件。");
+            return;
+        }
+
+        foreach (var item in items)
+        {
+            Console.WriteLine($"{(item.IsDirectory ? "[D]" : "[F]")} {item.Path}");
+            Console.WriteLine(
+                $"    fs_id={item.FileSystemId}  size={FormatBytes(item.SizeBytes)}  modified={FormatTimestamp(item.ServerModifiedAt)}");
+        }
+    }
+
     private static BaiduOAuthOptions ReadOptions() => new()
     {
         ClientId = Environment.GetEnvironmentVariable("BAIDU_CLIENT_ID") ?? string.Empty,
@@ -237,6 +335,30 @@ internal static class BaiduCli
         return $"{value:0.##} {units[unitIndex]}";
     }
 
+    private static string FormatTimestamp(DateTimeOffset? timestamp) =>
+        timestamp?.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss zzz", CultureInfo.InvariantCulture)
+        ?? "(未返回)";
+
+    private static BaiduFileOrder ParseFileOrder(string value) => value.ToLowerInvariant() switch
+    {
+        "name" => BaiduFileOrder.Name,
+        "time" => BaiduFileOrder.Time,
+        "size" => BaiduFileOrder.Size,
+        _ => throw new ArgumentException("--order 只支持 name、time 或 size。")
+    };
+
+    private static long[] ParseFileSystemIds(string value)
+    {
+        var segments = value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (segments.Length == 0 || segments.Any(segment =>
+                !long.TryParse(segment, NumberStyles.None, CultureInfo.InvariantCulture, out var id) || id <= 0))
+        {
+            throw new ArgumentException("--fs-id 必须是以逗号分隔的正整数。");
+        }
+
+        return segments.Select(segment => long.Parse(segment, CultureInfo.InvariantCulture)).ToArray();
+    }
+
     private static bool HasFlag(string[] args, string name) =>
         args.Any(arg => string.Equals(arg, name, StringComparison.OrdinalIgnoreCase));
 
@@ -258,6 +380,19 @@ internal static class BaiduCli
         }
 
         return null;
+    }
+
+    private static int GetIntOption(string[] args, string name, int defaultValue)
+    {
+        var value = GetOption(args, name);
+        if (value is null)
+        {
+            return defaultValue;
+        }
+
+        return int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var result)
+            ? result
+            : throw new ArgumentException($"参数 {name} 必须是整数。");
     }
 
     private static string? FirstPositional(string[] args)
@@ -298,6 +433,11 @@ internal static class BaiduCli
               show
               account
               quota
+              ls [--dir <路径>] [--start <偏移>] [--limit <数量>]
+                 [--order name|time|size] [--desc] [--folders-only]
+              search --key <关键词> [--dir <路径>] [--page <页码>]
+                     [--page-size <数量>] [--current-dir-only]
+              meta --fs-id <ID[,ID...]>
             """);
     }
 }
