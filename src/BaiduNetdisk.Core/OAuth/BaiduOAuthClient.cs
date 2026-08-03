@@ -11,13 +11,18 @@ public sealed class BaiduOAuthClient
 
     private readonly HttpClient _httpClient;
     private readonly BaiduOAuthOptions _options;
+    private readonly TimeProvider _timeProvider;
 
-    public BaiduOAuthClient(HttpClient httpClient, BaiduOAuthOptions options)
+    public BaiduOAuthClient(
+        HttpClient httpClient,
+        BaiduOAuthOptions options,
+        TimeProvider? timeProvider = null)
     {
         ArgumentNullException.ThrowIfNull(httpClient);
         ArgumentNullException.ThrowIfNull(options);
         _httpClient = httpClient;
         _options = options;
+        _timeProvider = timeProvider ?? TimeProvider.System;
     }
 
     public Uri BuildAuthorizationUri(
@@ -141,7 +146,7 @@ public sealed class BaiduOAuthClient
                 (int)response.StatusCode);
         }
 
-        return token with { AcquiredAtUtc = DateTimeOffset.UtcNow };
+        return token with { AcquiredAtUtc = _timeProvider.GetUtcNow() };
     }
 
     private static Uri BuildUri(Uri endpoint, IReadOnlyDictionary<string, string> parameters)

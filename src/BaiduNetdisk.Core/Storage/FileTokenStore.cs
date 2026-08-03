@@ -3,7 +3,7 @@ using BaiduNetdisk.OAuth;
 
 namespace BaiduNetdisk.Storage;
 
-public sealed class FileTokenStore
+public sealed class FileTokenStore : IBaiduTokenStore
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
     {

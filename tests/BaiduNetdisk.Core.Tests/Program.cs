@@ -6,6 +6,7 @@ using BaiduNetdisk.Api;
 using BaiduNetdisk.Download;
 using BaiduNetdisk.Management;
 using BaiduNetdisk.OAuth;
+using BaiduNetdisk.Storage;
 using BaiduNetdisk.Upload;
 
 var tests = new (string Name, Func<Task> Run)[]
@@ -37,7 +38,14 @@ var tests = new (string Name, Func<Task> Run)[]
     ("移动仅显式启用覆盖", MoveUsesExplicitOverwrite),
     ("重命名发送安全文件名", RenameUsesLeafName),
     ("删除要求显式确认", DeleteRequiresConfirmation),
-    ("文件管理严格限制应用目录", ManagementIsRestrictedToAppRoot)
+    ("文件管理严格限制应用目录", ManagementIsRestrictedToAppRoot),
+    ("有效 Token 不触发刷新", ValidTokenDoesNotRefresh),
+    ("即将过期 Token 自动刷新并保存", ExpiringTokenIsRefreshedAndSaved),
+    ("并发调用只刷新一次", ConcurrentRefreshIsCoalesced),
+    ("缺少 Token 时要求重新授权", MissingTokenRequiresLogin),
+    ("Refresh Token 失效时要求重新授权", InvalidRefreshTokenRequiresLogin),
+    ("鉴权拒绝后刷新并重试", AuthenticationFailureRefreshesAndRetries),
+    ("临时刷新失败不覆盖 Token", TransientRefreshFailurePreservesToken)
 };
 
 var failures = 0;
@@ -791,6 +799,157 @@ static async Task ManagementIsRestrictedToAppRoot()
     Assert(requestCount == 0, "应用目录外的管理操作不应发起网络请求。");
 }
 
+static async Task ValidTokenDoesNotRefresh()
+{
+    var now = new DateTimeOffset(2030, 1, 1, 0, 0, 0, TimeSpan.Zero);
+    var store = new MemoryTokenStore(TokenAt("valid-access", "valid-refresh", now, 3600));
+    var refreshCalls = 0;
+    using var session = CreateAuthenticatedSession(store, now, _ =>
+    {
+        refreshCalls++;
+        return Json(HttpStatusCode.OK, "{}");
+    });
+
+    var token = await session.GetTokenAsync();
+    Assert(token.AccessToken == "valid-access", "有效 Token 被意外替换。");
+    Assert(refreshCalls == 0 && store.SaveCount == 0, "有效 Token 不应触发刷新或保存。");
+}
+
+static async Task ExpiringTokenIsRefreshedAndSaved()
+{
+    var now = new DateTimeOffset(2030, 1, 1, 0, 0, 0, TimeSpan.Zero);
+    var store = new MemoryTokenStore(TokenAt("old-access", "old-refresh", now.AddMinutes(-56), 3600));
+    using var session = CreateAuthenticatedSession(store, now, request =>
+    {
+        Assert(QueryValue(request.RequestUri!, "grant_type") == "refresh_token", "刷新 grant_type 不正确。");
+        Assert(QueryValue(request.RequestUri!, "refresh_token") == "old-refresh", "没有使用已保存的 Refresh Token。");
+        return Json(HttpStatusCode.OK,
+            """{"access_token":"new-access","expires_in":2592000,"refresh_token":"new-refresh","scope":"basic netdisk"}""");
+    });
+
+    var token = await session.GetTokenAsync();
+    Assert(token.AccessToken == "new-access", "没有返回刷新后的 Access Token。");
+    Assert(token.AcquiredAtUtc == now, "刷新后的获取时间没有使用统一时钟。");
+    Assert(store.SaveCount == 1 && store.SavedToken?.RefreshToken == "new-refresh",
+        "刷新后的 Token 没有保存。");
+}
+
+static async Task ConcurrentRefreshIsCoalesced()
+{
+    var now = new DateTimeOffset(2030, 1, 1, 0, 0, 0, TimeSpan.Zero);
+    var store = new MemoryTokenStore(TokenAt("old-access", "old-refresh", now.AddHours(-2), 3600));
+    var refreshCalls = 0;
+    using var session = CreateAuthenticatedSession(store, now, _ =>
+    {
+        Interlocked.Increment(ref refreshCalls);
+        Thread.Sleep(40);
+        return Json(HttpStatusCode.OK,
+            """{"access_token":"shared-access","expires_in":2592000,"refresh_token":"shared-refresh"}""");
+    });
+
+    var tasks = Enumerable.Range(0, 20)
+        .Select(_ => Task.Run(() => session.GetTokenAsync()))
+        .ToArray();
+    var tokens = await Task.WhenAll(tasks);
+    Assert(tokens.All(token => token.AccessToken == "shared-access"), "并发调用没有共享刷新结果。");
+    Assert(refreshCalls == 1 && store.SaveCount == 1, "并发调用触发了多次刷新或保存。");
+}
+
+static async Task MissingTokenRequiresLogin()
+{
+    var now = new DateTimeOffset(2030, 1, 1, 0, 0, 0, TimeSpan.Zero);
+    var store = new MemoryTokenStore(null);
+    using var session = CreateAuthenticatedSession(store, now, _ =>
+        throw new InvalidOperationException("缺少 Token 时不应请求 OAuth。"));
+
+    await AssertThrowsAsync<BaiduReauthorizationRequiredException>(() => session.GetTokenAsync());
+    Assert(store.SaveCount == 0, "缺少 Token 时不应保存数据。");
+}
+
+static async Task InvalidRefreshTokenRequiresLogin()
+{
+    var now = new DateTimeOffset(2030, 1, 1, 0, 0, 0, TimeSpan.Zero);
+    var original = TokenAt("old-access", "revoked-refresh", now.AddHours(-2), 3600);
+    var store = new MemoryTokenStore(original);
+    using var session = CreateAuthenticatedSession(store, now, _ =>
+        Json(HttpStatusCode.BadRequest,
+            """{"error":"invalid_grant","error_description":"refresh token revoked"}"""));
+
+    await AssertThrowsAsync<BaiduReauthorizationRequiredException>(() => session.GetTokenAsync());
+    Assert(store.SaveCount == 0 && ReferenceEquals(store.CurrentToken, original),
+        "失效刷新不应覆盖原 Token。");
+}
+
+static async Task AuthenticationFailureRefreshesAndRetries()
+{
+    var now = new DateTimeOffset(2030, 1, 1, 0, 0, 0, TimeSpan.Zero);
+    var store = new MemoryTokenStore(TokenAt("rejected-access", "valid-refresh", now, 3600));
+    using var session = CreateAuthenticatedSession(store, now, _ =>
+        Json(HttpStatusCode.OK,
+            """{"access_token":"retry-access","expires_in":2592000,"refresh_token":"retry-refresh"}"""));
+    var operationCalls = 0;
+
+    var result = await session.ExecuteAsync((accessToken, _) =>
+    {
+        operationCalls++;
+        if (accessToken == "rejected-access")
+        {
+            throw new BaiduNetdiskApiException(-6, "authentication failed");
+        }
+
+        Assert(accessToken == "retry-access", "重试没有使用刷新后的 Access Token。");
+        return Task.FromResult("ok");
+    });
+
+    Assert(result == "ok" && operationCalls == 2, "鉴权失败后没有只重试一次。");
+    Assert(store.SaveCount == 1, "服务端拒绝后刷新结果没有保存。");
+}
+
+static async Task TransientRefreshFailurePreservesToken()
+{
+    var now = new DateTimeOffset(2030, 1, 1, 0, 0, 0, TimeSpan.Zero);
+    var original = TokenAt("old-access", "valid-refresh", now.AddHours(-2), 3600);
+    var store = new MemoryTokenStore(original);
+    using var session = CreateAuthenticatedSession(store, now, _ =>
+        Json(HttpStatusCode.ServiceUnavailable, "service unavailable"));
+
+    await AssertThrowsAsync<BaiduOAuthException>(() => session.GetTokenAsync());
+    Assert(store.SaveCount == 0 && ReferenceEquals(store.CurrentToken, original),
+        "临时刷新失败不应覆盖原 Token。");
+}
+
+static BaiduAuthenticatedSession CreateAuthenticatedSession(
+    MemoryTokenStore store,
+    DateTimeOffset now,
+    Func<HttpRequestMessage, HttpResponseMessage> responseFactory)
+{
+    var timeProvider = new FixedTimeProvider(now);
+    var options = new BaiduOAuthOptions
+    {
+        ClientId = "client-id",
+        ClientSecret = "client-secret"
+    };
+    var oauth = new BaiduOAuthClient(
+        new HttpClient(new StubHandler(responseFactory)),
+        options,
+        timeProvider);
+    return new BaiduAuthenticatedSession(oauth, store, timeProvider: timeProvider);
+}
+
+static BaiduTokenSet TokenAt(
+    string accessToken,
+    string refreshToken,
+    DateTimeOffset acquiredAt,
+    int expiresIn) =>
+    new()
+    {
+        AccessToken = accessToken,
+        RefreshToken = refreshToken,
+        ExpiresIn = expiresIn,
+        AcquiredAtUtc = acquiredAt,
+        Scope = "basic netdisk"
+    };
+
 static BaiduOAuthClient CreateOAuthClient(Func<HttpRequestMessage, HttpResponseMessage> responseFactory)
 {
     var options = new BaiduOAuthOptions
@@ -992,4 +1151,40 @@ file sealed class RecordingUploadProgress : IProgress<BaiduUploadProgress>
     public BaiduUploadProgress? Last { get; private set; }
 
     public void Report(BaiduUploadProgress value) => Last = value;
+}
+
+file sealed class MemoryTokenStore(BaiduTokenSet? token) : IBaiduTokenStore
+{
+    private BaiduTokenSet? _token = token;
+    private int _loadCount;
+    private int _saveCount;
+
+    public BaiduTokenSet? CurrentToken => Volatile.Read(ref _token);
+
+    public BaiduTokenSet? SavedToken { get; private set; }
+
+    public int LoadCount => Volatile.Read(ref _loadCount);
+
+    public int SaveCount => Volatile.Read(ref _saveCount);
+
+    public Task<BaiduTokenSet?> LoadAsync(CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        Interlocked.Increment(ref _loadCount);
+        return Task.FromResult(CurrentToken);
+    }
+
+    public Task SaveAsync(BaiduTokenSet value, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        SavedToken = value;
+        Volatile.Write(ref _token, value);
+        Interlocked.Increment(ref _saveCount);
+        return Task.CompletedTask;
+    }
+}
+
+file sealed class FixedTimeProvider(DateTimeOffset utcNow) : TimeProvider
+{
+    public override DateTimeOffset GetUtcNow() => utcNow;
 }
