@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <RootNamespace>BaiduNetdisk.Mcp</RootNamespace>
+    <AssemblyName>baidu-netdisk-mcp</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.10" />
+    <PackageReference Include="ModelContextProtocol" Version="2.0.0" />
+    <ProjectReference Include="../BaiduNetdisk.Core/BaiduNetdisk.Core.csproj" />
+  </ItemGroup>
+</Project>
