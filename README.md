@@ -1,6 +1,6 @@
 # 百度网盘 C# 工具
 
-当前完成 OAuth 2.0 授权码流程以及账号、文件查询、下载和上传。项目使用 .NET 8，不依赖第三方 NuGet 包。
+当前完成 OAuth 2.0 授权码流程、账号与文件操作，以及本地 `stdio` MCP Server。项目使用 .NET 8；MCP 层采用官方 `ModelContextProtocol` C# SDK。
 
 已支持：
 
@@ -209,6 +209,68 @@ dotnet run --project src/BaiduNetdisk.Cli -- refresh
 
 `show` 只展示本地保存的脱敏 Token 状态，不会主动刷新或发起网络请求。
 
+## 10. 运行 MCP Server
+
+MCP Server 使用本地 `stdio` 传输，不监听端口，因此不需要 FRP、公网域名或 OAuth 回调服务器。先构建：
+
+```powershell
+dotnet build BaiduNetdiskTool.slnx -c Release
+```
+
+启动命令：
+
+```powershell
+dotnet run --project src/BaiduNetdisk.Mcp -c Release --no-build
+```
+
+启动后标准输入和标准输出由 MCP 客户端接管，不会出现交互式提示；诊断日志只写入标准错误。
+
+可在支持 MCP 的客户端中使用类似配置，路径请替换为本机仓库的绝对路径：
+
+```json
+{
+  "mcpServers": {
+    "baidu-netdisk": {
+      "command": "dotnet",
+      "args": [
+        "run",
+        "--project",
+        "D:\\github\\tool-baidu-mcp\\src\\BaiduNetdisk.Mcp",
+        "-c",
+        "Release",
+        "--no-build"
+      ],
+      "env": {
+        "BAIDU_CLIENT_ID": "你的 API Key",
+        "BAIDU_CLIENT_SECRET": "你的 Secret Key",
+        "BAIDU_APP_ROOT": "/apps/你的应用名",
+        "BAIDU_LOCAL_ROOTS": "D:\\Downloads;D:\\Uploads"
+      }
+    }
+  }
+}
+```
+
+MCP 客户端配置文件包含 `Secret Key` 时，应限制为当前用户可读且不要提交到仓库。Token 默认继续使用 `%LOCALAPPDATA%\BaiduNetdiskMcp\tokens.json`；也可以通过 `BAIDU_TOKEN_FILE` 指定。
+
+提供的工具：
+
+- `server_info`、`get_account`、`get_quota`；
+- `list_files`、`search_files`、`get_file_metadata`；
+- `download_file`、`upload_file`；
+- `create_directory`、`copy_files`、`move_files`、`rename_file`、`delete_files`。
+
+安全和返回限制：
+
+- `BAIDU_LOCAL_ROOTS` 是上传源文件和下载目标的本地允许目录列表；Windows 使用分号分隔；
+- `BAIDU_APP_ROOT` 限制全部网盘写操作，读取工具仍可按授权范围读取；
+- `BAIDU_MCP_MAX_ITEMS` 控制列表和搜索的单次最大返回量，默认且最高为 `100`；
+- `BAIDU_MCP_MAX_RESPONSE_CHARS` 控制工具文本响应长度，默认 `50000`，超限时返回缩小查询范围的提示；
+- 下载默认不覆盖，上传默认重名自动改名，复制和移动默认冲突失败；
+- `delete_files` 必须显式传入 `confirm: true`。
+
+服务器同时支持 `2026-07-28` 的 `server/discover` 流程和兼容客户端使用的 `2025-11-25` `initialize` 流程。
+
 ## 开发计划
 
 完整的功能边界、验收条件和提交拆分见 [需求文档](docs/requirements.md)。
@@ -217,3 +279,4 @@ dotnet run --project src/BaiduNetdisk.Cli -- refresh
 
 - [百度 OAuth 接入指南](https://openauth.baidu.com/doc/doc.html)
 - [百度网盘开放平台](https://pan.baidu.com/union/)
+- [官方 MCP C# SDK](https://github.com/modelcontextprotocol/csharp-sdk)
