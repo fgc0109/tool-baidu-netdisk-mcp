@@ -277,6 +277,8 @@ Windows 默认使用 `BAIDU_TOKEN_PROTECTION=auto`，即当前用户范围的 DP
 
 完整的功能边界、验收条件和提交拆分见 [需求文档](docs/requirements.md)。
 
+当前版本的功能、兼容性、验证记录和升级说明见 [版本记录](docs/versions/README.md)。
+
 ## 官方资料
 
 - [百度 OAuth 接入指南](https://openauth.baidu.com/doc/doc.html)
