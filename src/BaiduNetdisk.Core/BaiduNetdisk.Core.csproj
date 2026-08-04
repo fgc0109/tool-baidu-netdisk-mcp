@@ -4,4 +4,7 @@
     <RootNamespace>BaiduNetdisk</RootNamespace>
     <AssemblyName>BaiduNetdisk.Core</AssemblyName>
   </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="10.0.10" />
+  </ItemGroup>
 </Project>

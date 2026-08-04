@@ -7,7 +7,7 @@ public sealed class BaiduOAuthException : Exception
         string? description,
         int? statusCode = null,
         Exception? innerException = null)
-        : base(string.IsNullOrWhiteSpace(description) ? error : $"{error}: {description}", innerException)
+        : base("百度 OAuth 请求失败。", innerException)
     {
         Error = error;
         Description = description;

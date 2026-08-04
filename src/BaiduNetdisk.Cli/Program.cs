@@ -3,6 +3,7 @@ using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
 using BaiduNetdisk.Api;
+using BaiduNetdisk.Diagnostics;
 using BaiduNetdisk.Download;
 using BaiduNetdisk.Management;
 using BaiduNetdisk.OAuth;
@@ -27,7 +28,10 @@ internal static class BaiduCli
             var command = args[0].ToLowerInvariant();
             var commandArgs = args[1..];
             var options = ReadOptions();
-            var tokenStore = new FileTokenStore(GetTokenPath());
+            var tokenStore = BaiduTokenStoreFactory.Create(
+                GetTokenPath(),
+                BaiduTokenStoreFactory.ParseMode(
+                    Environment.GetEnvironmentVariable("BAIDU_TOKEN_PROTECTION")));
 
             using var httpClient = new HttpClient
             {
@@ -70,9 +74,14 @@ internal static class BaiduCli
             Console.Error.WriteLine($"授权失效：{exception.Message}");
             return 3;
         }
-        catch (Exception exception) when (exception is ArgumentException or InvalidOperationException or BaiduOAuthException or BaiduNetdiskApiException or IOException or UnauthorizedAccessException or HttpRequestException)
+        catch (HttpRequestException)
         {
-            Console.Error.WriteLine($"错误：{exception.Message}");
+            Console.Error.WriteLine("错误：连接百度服务失败，请稍后重试。");
+            return 1;
+        }
+        catch (Exception exception) when (exception is ArgumentException or InvalidOperationException or BaiduOAuthException or BaiduNetdiskApiException or IOException or UnauthorizedAccessException)
+        {
+            Console.Error.WriteLine($"错误：{SensitiveDataRedactor.Redact(exception.Message)}");
             return 1;
         }
     }
@@ -88,7 +97,7 @@ internal static class BaiduCli
 
     private static async Task<int> LoginAsync(
         BaiduOAuthClient oauth,
-        FileTokenStore tokenStore,
+        IBaiduTokenStore tokenStore,
         string[] args)
     {
         var state = CreateState();
@@ -113,7 +122,7 @@ internal static class BaiduCli
 
     private static async Task<int> ExchangeAsync(
         BaiduOAuthClient oauth,
-        FileTokenStore tokenStore,
+        IBaiduTokenStore tokenStore,
         string[] args)
     {
         var input = GetOption(args, "--code") ?? FirstPositional(args)
@@ -128,7 +137,7 @@ internal static class BaiduCli
 
     private static async Task<int> RefreshAsync(
         BaiduOAuthClient oauth,
-        FileTokenStore tokenStore,
+        IBaiduTokenStore tokenStore,
         string[] args)
     {
         var stored = await tokenStore.LoadAsync();
@@ -140,7 +149,7 @@ internal static class BaiduCli
         return 0;
     }
 
-    private static async Task<int> ShowAsync(FileTokenStore tokenStore)
+    private static async Task<int> ShowAsync(IBaiduTokenStore tokenStore)
     {
         var token = await tokenStore.LoadAsync()
             ?? throw new InvalidOperationException($"Token 文件不存在：{tokenStore.Path}");
@@ -710,6 +719,7 @@ internal static class BaiduCli
               BAIDU_REDIRECT_URI   可选，默认 oob
               BAIDU_OAUTH_SCOPE    可选，默认 "basic netdisk"
               BAIDU_TOKEN_FILE     可选，Token 保存路径
+              BAIDU_TOKEN_PROTECTION 可选，auto（默认）、dpapi 或 plain
               BAIDU_APP_ROOT       upload 和文件管理必填，例如 /apps/你的应用名
 
             命令：

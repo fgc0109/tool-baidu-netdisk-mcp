@@ -1,4 +1,5 @@
 using BaiduNetdisk.OAuth;
+using BaiduNetdisk.Storage;
 
 namespace BaiduNetdisk.Mcp;
 
@@ -7,6 +8,8 @@ public sealed record BaiduMcpOptions
     public required BaiduOAuthOptions OAuth { get; init; }
 
     public required string TokenPath { get; init; }
+
+    public BaiduTokenProtectionMode TokenProtection { get; init; }
 
     public string? AppRoot { get; init; }
 
@@ -44,6 +47,8 @@ public sealed record BaiduMcpOptions
                     ?? BaiduOAuthOptions.DefaultScope
             },
             TokenPath = tokenPath,
+            TokenProtection = BaiduTokenStoreFactory.ParseMode(
+                Environment.GetEnvironmentVariable("BAIDU_TOKEN_PROTECTION")),
             AppRoot = Environment.GetEnvironmentVariable("BAIDU_APP_ROOT"),
             LocalRoots = roots,
             MaximumItems = ReadInteger("BAIDU_MCP_MAX_ITEMS", 100, 1, 100),

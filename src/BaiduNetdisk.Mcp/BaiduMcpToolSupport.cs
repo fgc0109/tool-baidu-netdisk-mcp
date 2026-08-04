@@ -1,4 +1,5 @@
 using BaiduNetdisk.Api;
+using BaiduNetdisk.Diagnostics;
 using BaiduNetdisk.OAuth;
 using ModelContextProtocol;
 
@@ -34,7 +35,9 @@ internal static class BaiduMcpToolSupport
         }
         catch (BaiduOAuthException exception)
         {
-            throw new McpException($"百度 OAuth 操作失败：{exception.Error}。", exception);
+            throw new McpException(
+                $"百度 OAuth 操作失败：{SensitiveDataRedactor.Redact(exception.Error)}。",
+                exception);
         }
         catch (HttpRequestException exception)
         {
@@ -46,7 +49,7 @@ internal static class BaiduMcpToolSupport
             IOException or
             UnauthorizedAccessException)
         {
-            throw new McpException(exception.Message, exception);
+            throw new McpException(SensitiveDataRedactor.Redact(exception.Message), exception);
         }
     }
 

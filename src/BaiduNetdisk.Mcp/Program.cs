@@ -16,6 +16,7 @@ builder.Logging.AddConsole(options =>
     // stdout is reserved exclusively for MCP JSON-RPC frames.
     options.LogToStandardErrorThreshold = LogLevel.Trace;
 });
+builder.Logging.SetMinimumLevel(LogLevel.Warning);
 var mcpOptions = BaiduMcpOptions.FromEnvironment();
 builder.Services.AddSingleton(mcpOptions);
 builder.Services.AddSingleton(new HttpClient { Timeout = TimeSpan.FromMinutes(5) });
@@ -24,7 +25,10 @@ builder.Services.AddSingleton<BaiduOAuthClient>(services =>
         services.GetRequiredService<HttpClient>(),
         services.GetRequiredService<BaiduMcpOptions>().OAuth));
 builder.Services.AddSingleton<IBaiduTokenStore>(services =>
-    new FileTokenStore(services.GetRequiredService<BaiduMcpOptions>().TokenPath));
+{
+    var options = services.GetRequiredService<BaiduMcpOptions>();
+    return BaiduTokenStoreFactory.Create(options.TokenPath, options.TokenProtection);
+});
 builder.Services.AddSingleton<BaiduAuthenticatedSession>();
 builder.Services.AddSingleton<BaiduNetdiskClient>();
 builder.Services.AddSingleton<BaiduDownloadService>();

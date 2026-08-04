@@ -3,6 +3,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using BaiduNetdisk.Api;
+using BaiduNetdisk.Diagnostics;
 using BaiduNetdisk.Download;
 using BaiduNetdisk.Management;
 using BaiduNetdisk.OAuth;
@@ -45,7 +46,11 @@ var tests = new (string Name, Func<Task> Run)[]
     ("缺少 Token 时要求重新授权", MissingTokenRequiresLogin),
     ("Refresh Token 失效时要求重新授权", InvalidRefreshTokenRequiresLogin),
     ("鉴权拒绝后刷新并重试", AuthenticationFailureRefreshesAndRetries),
-    ("临时刷新失败不覆盖 Token", TransientRefreshFailurePreservesToken)
+    ("临时刷新失败不覆盖 Token", TransientRefreshFailurePreservesToken),
+    ("敏感字段不会进入错误消息", SensitiveFieldsAreRedacted),
+    ("Token 存储工厂选择安全默认值", TokenStoreFactoryUsesSafeDefault),
+    ("DPAPI 加密保存并读取 Token", DpapiTokenRoundTrip),
+    ("DPAPI 自动迁移旧明文 Token", DpapiMigratesPlainTextToken)
 };
 
 var failures = 0;
@@ -1096,6 +1101,102 @@ static void Assert(bool condition, string message)
     }
 }
 
+static Task SensitiveFieldsAreRedacted()
+{
+    const string accessToken = "access-secret-value";
+    const string refreshToken = "refresh-secret-value";
+    const string clientSecret = "client-secret-value";
+    var input = $"access_token={accessToken}&refresh_token={refreshToken} "
+        + $"client_secret: \"{clientSecret}\" Authorization: Bearer bearer-secret";
+    var redacted = SensitiveDataRedactor.Redact(input);
+
+    Assert(!redacted.Contains(accessToken, StringComparison.Ordinal), "Access Token 未脱敏。");
+    Assert(!redacted.Contains(refreshToken, StringComparison.Ordinal), "Refresh Token 未脱敏。");
+    Assert(!redacted.Contains(clientSecret, StringComparison.Ordinal), "Client Secret 未脱敏。");
+    Assert(!redacted.Contains("bearer-secret", StringComparison.Ordinal), "Bearer Token 未脱敏。");
+
+    var oauthException = new BaiduOAuthException("invalid_grant", $"refresh_token={refreshToken}");
+    Assert(!oauthException.Message.Contains(refreshToken, StringComparison.Ordinal),
+        "OAuth 远端描述不应进入异常消息。");
+    return Task.CompletedTask;
+}
+
+static Task TokenStoreFactoryUsesSafeDefault()
+{
+    var path = Path.Combine(Path.GetTempPath(), $"baidu-token-factory-{Guid.NewGuid():N}.json");
+    var store = BaiduTokenStoreFactory.Create(path);
+    Assert(
+        OperatingSystem.IsWindows()
+            ? store is ProtectedFileTokenStore
+            : store is FileTokenStore,
+        "auto 模式没有选择预期的 Token 存储实现。");
+    AssertThrows<InvalidOperationException>(() => BaiduTokenStoreFactory.ParseMode("unknown"));
+    return Task.CompletedTask;
+}
+
+static async Task DpapiTokenRoundTrip()
+{
+    if (!OperatingSystem.IsWindows())
+    {
+        return;
+    }
+
+    var directory = Path.Combine(Path.GetTempPath(), $"baidu-token-test-{Guid.NewGuid():N}");
+    var path = Path.Combine(directory, "tokens.json");
+    var token = TokenAt("roundtrip-access-secret", "roundtrip-refresh-secret", DateTimeOffset.UtcNow, 3600);
+    try
+    {
+        var store = new ProtectedFileTokenStore(path);
+        await store.SaveAsync(token);
+        var raw = await File.ReadAllTextAsync(path);
+        Assert(raw.Contains("dpapi-current-user", StringComparison.Ordinal), "缺少 DPAPI 格式标记。");
+        Assert(!raw.Contains(token.AccessToken, StringComparison.Ordinal), "文件泄露了 Access Token 明文。");
+        Assert(!raw.Contains(token.RefreshToken, StringComparison.Ordinal), "文件泄露了 Refresh Token 明文。");
+
+        var loaded = await store.LoadAsync();
+        Assert(loaded?.AccessToken == token.AccessToken, "DPAPI 解密后的 Access Token 不一致。");
+        Assert(loaded?.RefreshToken == token.RefreshToken, "DPAPI 解密后的 Refresh Token 不一致。");
+    }
+    finally
+    {
+        if (Directory.Exists(directory))
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+}
+
+static async Task DpapiMigratesPlainTextToken()
+{
+    if (!OperatingSystem.IsWindows())
+    {
+        return;
+    }
+
+    var directory = Path.Combine(Path.GetTempPath(), $"baidu-token-migration-{Guid.NewGuid():N}");
+    var path = Path.Combine(directory, "tokens.json");
+    var token = TokenAt("legacy-access-secret", "legacy-refresh-secret", DateTimeOffset.UtcNow, 3600);
+    try
+    {
+        await new FileTokenStore(path).SaveAsync(token);
+        var store = new ProtectedFileTokenStore(path);
+        var loaded = await store.LoadAsync();
+        var migrated = await File.ReadAllTextAsync(path);
+
+        Assert(loaded?.AccessToken == token.AccessToken, "迁移后 Access Token 不一致。");
+        Assert(migrated.Contains("dpapi-current-user", StringComparison.Ordinal), "旧 Token 未迁移为 DPAPI。");
+        Assert(!migrated.Contains(token.AccessToken, StringComparison.Ordinal), "迁移后仍包含 Access Token 明文。");
+        Assert(!migrated.Contains(token.RefreshToken, StringComparison.Ordinal), "迁移后仍包含 Refresh Token 明文。");
+    }
+    finally
+    {
+        if (Directory.Exists(directory))
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+}
+
 static void AssertThrows<TException>(Action action)
     where TException : Exception
 {
@@ -1158,6 +1259,8 @@ file sealed class MemoryTokenStore(BaiduTokenSet? token) : IBaiduTokenStore
     private BaiduTokenSet? _token = token;
     private int _loadCount;
     private int _saveCount;
+
+    public string Path => "memory://tokens";
 
     public BaiduTokenSet? CurrentToken => Volatile.Read(ref _token);
 
