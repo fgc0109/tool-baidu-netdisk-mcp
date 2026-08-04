@@ -1,6 +1,6 @@
 # 百度网盘 C# 工具
 
-当前完成 OAuth 2.0 授权码流程、账号与文件操作，以及本地 `stdio` MCP Server。项目使用 .NET 8；MCP 层采用官方 `ModelContextProtocol` C# SDK。
+当前完成 OAuth 2.0 授权码流程、账号与文件操作，以及本地 `stdio` MCP Server。项目使用 .NET 10；MCP 层采用官方 `ModelContextProtocol` C# SDK。
 
 已支持：
 
