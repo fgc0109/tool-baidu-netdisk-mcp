@@ -126,6 +126,11 @@ static async Task<McpClient> CreateClientAsync(string isolatedRoot, string? prot
         "src",
         "BaiduNetdisk.Mcp",
         "BaiduNetdisk.Mcp.csproj");
+    var publishedExecutable = Environment.GetEnvironmentVariable("BAIDU_MCP_TEST_EXECUTABLE");
+    var usePublishedExecutable = !string.IsNullOrWhiteSpace(publishedExecutable);
+    var command = usePublishedExecutable
+        ? Path.GetFullPath(publishedExecutable!)
+        : "dotnet";
     var environment = StdioClientTransportOptions.GetDefaultEnvironmentVariables();
     environment["BAIDU_TOKEN_FILE"] = Path.Combine(isolatedRoot, "missing-token.json");
     environment["BAIDU_LOCAL_ROOTS"] = isolatedRoot;
@@ -134,9 +139,13 @@ static async Task<McpClient> CreateClientAsync(string isolatedRoot, string? prot
     var transport = new StdioClientTransport(new StdioClientTransportOptions
     {
         Name = "BaiduNetdiskMcpIntegrationTest",
-        Command = "dotnet",
-        Arguments = ["run", "--project", projectPath, "-c", "Release", "--no-build"],
-        WorkingDirectory = repositoryRoot,
+        Command = command,
+        Arguments = usePublishedExecutable
+            ? []
+            : ["run", "--project", projectPath, "-c", "Release", "--no-build"],
+        WorkingDirectory = usePublishedExecutable
+            ? Path.GetDirectoryName(command)
+            : repositoryRoot,
         InheritEnvironmentVariables = false,
         EnvironmentVariables = environment
     });

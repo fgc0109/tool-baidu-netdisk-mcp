@@ -7,7 +7,7 @@
 - 生成授权地址，并使用随机 `state` 防止回调流程中的 CSRF；
 - 使用授权码换取 Access Token / Refresh Token；
 - 刷新 Access Token；
-- 原子写入本地 Token 文件，控制台仅显示脱敏 Token；
+- Windows 使用当前用户 DPAPI 加密并原子写入 Token，旧明文文件自动迁移；
 - 解析授权码或完整回调 URL，并处理百度 OAuth 错误响应；
 - 查询授权用户信息和网盘容量；
 - 浏览、搜索和下载文件；
@@ -252,6 +252,8 @@ dotnet run --project src/BaiduNetdisk.Mcp -c Release --no-build
 ```
 
 MCP 客户端配置文件包含 `Secret Key` 时，应限制为当前用户可读且不要提交到仓库。Token 默认继续使用 `%LOCALAPPDATA%\BaiduNetdiskMcp\tokens.json`；也可以通过 `BAIDU_TOKEN_FILE` 指定。
+
+Windows 默认使用 `BAIDU_TOKEN_PROTECTION=auto`，即当前用户范围的 DPAPI。安全模型、显式兼容选项及日志脱敏规则见 [安全说明](docs/security.md)。无需安装 .NET 的 win-x64 发布包、首次授权和 MCP 客户端配置步骤见 [安装指南](docs/installation.md)。
 
 提供的工具：
 
